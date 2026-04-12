@@ -1,0 +1,105 @@
+module SourceLock where
+
+import DA.Time (Time, addRelTime, days)
+
+-- | Represents an asset locked on the source domain, awaiting mint confirmation
+-- from the bridge notary. The creation of this contract signifies the first step in
+-- the cross-chain bridge process. The user's original asset contract is consumed
+-- in the transaction that creates this `SourceLock`, effectively locking the value.
+template SourceLock
+  with
+    owner: Party
+      -- ^ The owner of the asset being bridged.
+    notary: Party
+      -- ^ The bridge notary responsible for minting on the target domain.
+    assetSymbol: Text
+      -- ^ The symbol of the locked asset (e.g., "USDC").
+    assetQuantity: Decimal
+      -- ^ The amount of the asset locked.
+    targetDomainId: Text
+      -- ^ An identifier for the destination Canton domain.
+    targetRecipient: Party
+      -- ^ The party who will receive the wrapped asset on the target domain.
+    bridgeSessionId: Text
+      -- ^ A unique identifier for this bridge transaction to prevent replays and
+      -- facilitate tracking across domains.
+    lockedAt: Time
+      -- ^ The timestamp when the asset was locked.
+  where
+    signatory owner
+    observer notary
+
+    key (owner, bridgeSessionId) : (Party, Text)
+    maintainer key._1
+
+    -- | The notary exercises this choice after successfully minting the corresponding
+    -- wrapped asset on the target domain. This transitions the state to await a
+    -- future burn-and-unlock event, creating a `PostMintConfirmation` contract.
+    choice NotaryConfirmMint : ContractId PostMintConfirmation
+      controller notary
+      do
+        create PostMintConfirmation with
+          owner
+          notary
+          assetSymbol
+          assetQuantity
+          targetDomainId
+          targetRecipient
+          bridgeSessionId
+          lockedAt
+
+    -- | An escape hatch for the owner to reclaim their locked asset if the notary
+    -- fails to confirm the mint within a specified timeout period (e.g., 24 hours).
+    -- Archiving this contract implies the asset is unlocked, and a script or
+    -- trigger would be responsible for recreating the original IOU contract.
+    choice ReclaimOnTimeout : ()
+      with
+        currentTime: Time
+          -- ^ The current ledger time, provided by the caller.
+      controller owner
+      do
+        let timeout = days 1
+        let expiryTime = addRelTime lockedAt timeout
+        assertMsg "Cannot reclaim asset before the timeout period has expired." (currentTime >= expiryTime)
+        pure ()
+
+-- | Represents the state after a bridged asset has been minted on the target domain.
+-- The original asset remains locked on the source domain, secured by this contract,
+-- until proof of burn is provided from the target domain.
+template PostMintConfirmation
+  with
+    owner: Party
+      -- ^ The original owner of the asset.
+    notary: Party
+      -- ^ The bridge notary.
+    assetSymbol: Text
+      -- ^ The symbol of the locked asset.
+    assetQuantity: Decimal
+      -- ^ The amount of the asset locked.
+    targetDomainId: Text
+      -- ^ Identifier for the destination Canton domain where the asset was minted.
+    targetRecipient: Party
+      -- ^ The recipient on the target domain.
+    bridgeSessionId: Text
+      -- ^ The unique identifier for this bridge transaction.
+    lockedAt: Time
+      -- ^ The original lock timestamp.
+  where
+    signatory owner, notary
+
+    key (owner, bridgeSessionId) : (Party, Text)
+    maintainer key._1
+
+    -- | The notary exercises this choice to unlock the original asset and return it
+    -- to the owner. This is done after verifying that the corresponding wrapped
+    -- asset has been burned on the target domain. Archiving this contract
+    -- completes the bridge round-trip, allowing a script or trigger to recreate
+    -- the original asset for the owner.
+    choice UnlockWithBurnProof : ()
+      with
+        burnProof: Text
+          -- ^ A reference or cryptographic proof of the burn transaction from
+          -- the target domain.
+      controller notary
+      do
+        pure ()
