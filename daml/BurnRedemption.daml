@@ -1,0 +1,71 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module BurnRedemption where
+
+import Daml.Script
+import DA.Time (Time, getTime)
+import Canton.MultiDomain (submitMultiDomain)
+import Canton.Types (DomainId)
+import SourceLock (SourceLock)
+import WrappedIOU (WrappedIOU)
+
+-- | Represents a pending request to redeem a wrapped asset. The owner has
+-- | committed their `WrappedIOU` to be burned, in exchange for the notary
+-- | unlocking the original asset on the source domain. This contract acts as
+-- | a multi-domain instruction with a timeout.
+template BurnRedemption
+  with
+    owner: Party
+      -- ^ The owner of the wrapped asset, initiating the redemption.
+    notary: Party
+      -- ^ The bridge notary responsible for coordinating the burn and unlock.
+    sourceDomainId: DomainId
+      -- ^ The domain where the original asset is locked.
+    sourceLockCid: ContractId SourceLock
+      -- ^ The contract holding the locked asset on the source domain.
+    wrappedIouCid: ContractId WrappedIOU
+      -- ^ The wrapped IOU contract to be burned on the target domain.
+    deadline: Time
+      -- ^ A timeout, after which the owner can reclaim their IOU if the notary
+      -- ^ has not processed the redemption.
+  where
+    signatory owner
+    observer notary
+
+    key (owner, notary, sourceLockCid) : (Party, Party, ContractId SourceLock)
+    maintainer key._1
+
+    -- | The notary executes the burn-and-unlock process. This choice is atomic
+    -- | across the source and target domains. It first burns the `WrappedIOU` on
+    -- | the current (target) domain, and then submits a command to the source
+    -- | domain to unlock the original `SourceLock` contract.
+    choice AcknowledgeBurnAndUnlock : ()
+      controller notary
+      do
+        -- Step 1: Burn the IOU on the target domain (this domain).
+        -- The `owner` is a signatory on this contract, so the `notary` (as controller)
+        -- can exercise the `Burn` choice on the owner's behalf.
+        exercise wrappedIouCid Burn
+
+        -- Step 2: Instruct the source domain to unlock the original asset.
+        -- This uses Canton's multi-domain submission feature to ensure atomicity.
+        -- If the `Unlock` fails on the source domain for any reason (e.g., lack of
+        -- authorization, contract already archived), the `Burn` on this domain
+        -- is also rolled back. The `notary` must be a controller on the `Unlock`
+        -- choice on the `SourceLock` template for this to succeed.
+        submitMultiDomain sourceDomainId do
+          exercise sourceLockCid Unlock
+
+        return ()
+
+    -- | If the notary fails to act before the deadline, the owner can cancel
+    -- | the redemption request. This archives the `BurnRedemption` contract,
+    -- | but leaves the `WrappedIOU` contract active, allowing the owner to
+    -- | retry the process or continue using the wrapped asset.
+    choice Reclaim : ()
+      controller owner
+      do
+        now <- getTime
+        assertMsg "Cannot reclaim before the deadline has passed" (now >= deadline)
+        return ()
