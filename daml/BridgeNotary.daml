@@ -1,0 +1,107 @@
+-- | This module defines the core BridgeNotary contract, which acts as the
+-- central coordinator for cross-domain asset transfers. It manages the
+-- lifecycle from locking an asset on the source domain, minting a wrapped
+-- IOU on the target domain, and handling the eventual redemption by burning
+-- the IOU and unlocking the original asset.
+--
+-- The typical flow is as follows:
+-- 1. A user locks an asset on the source domain, creating a `SourceAssetLock` contract.
+-- 2. A `BridgeNotary` contract is created, referencing the lock and in the `Locked` state.
+-- 3. The `notary` exercises `MintWrappedAsset` to create a `WrappedAsset` on the target domain. The state moves to `Minted`.
+-- 4. The `owner` of the `WrappedAsset` can later decide to bridge back. They exercise `InitiateRedemption`, providing the `WrappedAsset` to be burned. The state moves to `Burned`.
+-- 5. The `notary` verifies the burn and exercises `UnlockSourceAsset` to release the original asset from the `SourceAssetLock`. The `BridgeNotary` contract is archived, completing the cycle.
+module BridgeNotary where
+
+import Daml.Script
+import SourceLock (SourceAssetLock)
+import WrappedIOU (WrappedAsset)
+
+-- | Represents the state of a cross-domain asset bridge operation.
+data BridgeStatus
+  = Locked   -- ^ Source asset is locked, awaiting minting on target domain.
+  | Minted   -- ^ Wrapped asset has been minted on the target domain.
+  | Burned   -- ^ Wrapped asset has been burned, awaiting source asset unlock.
+  deriving (Eq, Show)
+
+-- | The central coordinating contract for the cross-domain bridge.
+-- It is created after an asset has been locked on the source domain and
+-- orchestrates the minting of a wrapped asset, and the eventual redemption
+-- process (burn and unlock).
+template BridgeNotary
+  with
+    notary            : Party
+      -- ^ The party operating the bridge service.
+    owner             : Party
+      -- ^ The user who is bridging the asset.
+    sourceLockCid     : ContractId SourceAssetLock
+      -- ^ A reference to the locked asset on the source domain.
+    targetDomainId    : Text
+      -- ^ The identifier for the target Canton domain.
+    sourceAssetSymbol : Text
+      -- ^ The symbol of the original asset being bridged.
+    amount            : Decimal
+      -- ^ The amount of the asset being bridged.
+    status            : BridgeStatus
+      -- ^ The current state of the bridge process.
+  where
+    signatory notary, owner
+
+    key (notary, owner, sourceLockCid) : (Party, Party, ContractId SourceAssetLock)
+    maintainer key._1
+
+    -- | Asserts that the contract is in a valid state.
+    ensure
+      case status of
+        Locked -> True
+        Minted -> True
+        Burned -> True
+
+    -- | The notary mints the corresponding wrapped asset on the target domain.
+    -- This moves the status from `Locked` to `Minted`.
+    choice MintWrappedAsset : ContractId BridgeNotary
+      controller notary
+      do
+        assertMsg "Asset must be in 'Locked' state to be minted." (status == Locked)
+
+        -- In a real multi-domain setup, this would be a cross-domain call.
+        -- For this model, we simulate it by creating the WrappedAsset here.
+        -- The wrapped asset symbol is prefixed with 'w' to denote it's a wrapped version.
+        let wrappedSymbol = "w" <> sourceAssetSymbol
+        _ <- create WrappedAsset with
+              issuer = notary
+              owner = owner
+              symbol = wrappedSymbol
+              amount = amount
+              observers = []
+
+        create this with status = Minted
+
+    -- | The owner initiates redemption by providing the wrapped asset to be burned.
+    -- This moves the status from `Minted` to `Burned`.
+    choice InitiateRedemption : ContractId BridgeNotary
+      with
+        wrappedAssetCid : ContractId WrappedAsset
+      controller owner
+      do
+        assertMsg "Asset must be in 'Minted' state to initiate redemption." (status == Minted)
+
+        -- Fetch and verify the wrapped asset before burning
+        wrappedAsset <- fetch wrappedAssetCid
+        assertMsg "Provided wrapped asset is not owned by you." (wrappedAsset.owner == owner)
+        assertMsg "Provided wrapped asset was not issued by the notary." (wrappedAsset.issuer == notary)
+        assertMsg "Wrapped asset amount does not match bridged amount." (wrappedAsset.amount == amount)
+        let wrappedSymbol = "w" <> sourceAssetSymbol
+        assertMsg "Wrapped asset symbol does not match bridged asset." (wrappedAsset.symbol == wrappedSymbol)
+
+        exercise wrappedAssetCid WrappedAsset.Burn
+
+        create this with status = Burned
+
+    -- | After the wrapped asset is burned, the notary unlocks the original asset
+    -- on the source domain. This completes the bridge-back process and archives
+    -- the BridgeNotary contract.
+    nonconsuming choice UnlockSourceAsset : ()
+      controller notary
+      do
+        assertMsg "Wrapped asset must be 'Burned' to unlock the source asset." (status == Burned)
+        exercise sourceLockCid SourceAssetLock.Unlock
