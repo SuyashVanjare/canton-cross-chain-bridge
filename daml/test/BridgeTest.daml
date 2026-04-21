@@ -1,0 +1,110 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module BridgeTest where
+
+import Daml.Script
+
+import SourceLock
+import WrappedIOU
+import BridgeNotary
+import BurnRedemption
+
+-- | A full round-trip test of the cross-domain bridge.
+-- This script simulates the entire lifecycle:
+-- 1. An asset is locked on the source "domain".
+-- 2. A wrapped IOU is minted on the target "domain" by a notary.
+-- 3. The owner of the wrapped IOU burns it to initiate redemption.
+-- 4. The notary confirms the burn, completing the process and "unlocking" the original asset.
+test_full_bridge_round_trip : Script ()
+test_full_bridge_round_trip = script do
+  -- === 1. SETUP: ALLOCATE PARTIES AND ROLES ===
+  debug "Setting up parties for the bridge test..."
+  sourceOwner <- allocatePartyWithHint "SourceOwner" (PartyIdHint "sourceowner")
+  targetOwner <- allocatePartyWithHint "TargetOwner" (PartyIdHint "targetowner")
+  notary      <- allocatePartyWithHint "Notary" (PartyIdHint "notary")
+  operator    <- allocatePartyWithHint "Operator" (PartyIdHint "operator")
+
+  -- The Notary and Operator establish a role contract that governs minting.
+  notaryRoleCid <- submit notary do
+    createCmd NotaryRole with notary, operator
+
+  debug $ "Parties allocated and NotaryRole created: " <> show notaryRoleCid
+
+  -- === 2. LOCK: SOURCE OWNER LOCKS AN ASSET ===
+  debug "Source owner is locking an asset..."
+  let
+    initialAmount = 1000.0
+    assetSymbol = "SRC_ASSET"
+
+  sourceLockCid <- submit sourceOwner do
+    createCmd SourceLock with
+      sourceOwner
+      targetOwner
+      operator
+      notary
+      amount = initialAmount
+      assetSymbol
+
+  -- The off-chain operator component would observe this contract creation.
+  -- We simulate this by fetching the contract as the operator to ensure visibility.
+  (fetchedLockCid, sourceLock) <- fetchContract sourceLockCid operator
+  assert (sourceLock.targetOwner == targetOwner)
+  assert (sourceLock.amount == initialAmount)
+  debug $ "Asset locked successfully in contract: " <> show fetchedLockCid
+
+  -- === 3. MINT: OPERATOR REQUESTS MINTING OF WRAPPED IOU ===
+  debug "Operator is requesting the notary to mint a wrapped IOU..."
+  -- This choice consumes the SourceLock contract to prevent double-minting
+  -- and creates the WrappedIOU contract on the target "domain".
+  wrappedIouCid <- submit operator do
+    exerciseCmd notaryRoleCid RequestMintWrappedIOU with sourceLockCid
+
+  -- Verify the SourceLock contract was consumed. This is a critical check
+  -- to ensure assets cannot be minted twice from the same lock.
+  debug "Verifying that the original SourceLock contract has been archived..."
+  submitMustFail operator do
+    fetchCmd sourceLockCid
+
+  -- The target owner should now have a WrappedIOU contract.
+  (fetchedIouCid, wrappedIou) <- fetchContract wrappedIouCid targetOwner
+  assert (wrappedIou.owner == targetOwner)
+  assert (wrappedIou.notary == notary)
+  assert (wrappedIou.amount == initialAmount)
+  assert (wrappedIou.assetSymbol == assetSymbol)
+  assert (wrappedIou.sourceLockCid == sourceLockCid)
+  debug $ "Wrapped IOU minted successfully for target owner: " <> show fetchedIouCid
+
+  -- === 4. BURN: TARGET OWNER REQUESTS REDEMPTION ===
+  debug "Target owner is burning the wrapped IOU to redeem the original asset..."
+  -- The owner of the wrapped IOU initiates the burn process.
+  -- This consumes the WrappedIOU and creates a BurnRedemption request for the notary.
+  burnRedemptionCid <- submit targetOwner do
+    exerciseCmd wrappedIouCid RequestBurn
+
+  -- Verify the WrappedIOU contract was consumed.
+  debug "Verifying that the WrappedIOU contract has been archived..."
+  submitMustFail targetOwner do
+    fetchCmd wrappedIouCid
+
+  -- The notary should now see a burn redemption request.
+  (fetchedRedemptionCid, burnRedemption) <- fetchContract burnRedemptionCid notary
+  assert (burnRedemption.redeemer == targetOwner)
+  assert (burnRedemption.notary == notary)
+  assert (burnRedemption.sourceLockCid == sourceLockCid)
+  debug $ "BurnRedemption request created for the notary: " <> show fetchedRedemptionCid
+
+  -- === 5. UNLOCK: NOTARY CONFIRMS BURN AND COMPLETES CYCLE ===
+  debug "Notary is confirming the burn and completing the cycle..."
+  -- The notary confirms they have witnessed the burn and finalizes the process.
+  -- In this IOU model, this archives the final contract in the chain,
+  -- representing the "unlocking" of the source asset (i.e., the liability is extinguished).
+  submit notary do
+    exerciseCmd burnRedemptionCid ConfirmBurnAndUnlock
+
+  -- Verify the BurnRedemption contract was consumed, completing the round trip.
+  debug "Verifying that the BurnRedemption contract has been archived..."
+  submitMustFail notary do
+    fetchCmd burnRedemptionCid
+
+  debug "SUCCESS: Bridge round-trip completed successfully."
