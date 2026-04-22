@@ -1,107 +1,192 @@
--- | This module defines the core BridgeNotary contract, which acts as the
--- central coordinator for cross-domain asset transfers. It manages the
--- lifecycle from locking an asset on the source domain, minting a wrapped
--- IOU on the target domain, and handling the eventual redemption by burning
--- the IOU and unlocking the original asset.
---
--- The typical flow is as follows:
--- 1. A user locks an asset on the source domain, creating a `SourceAssetLock` contract.
--- 2. A `BridgeNotary` contract is created, referencing the lock and in the `Locked` state.
--- 3. The `notary` exercises `MintWrappedAsset` to create a `WrappedAsset` on the target domain. The state moves to `Minted`.
--- 4. The `owner` of the `WrappedAsset` can later decide to bridge back. They exercise `InitiateRedemption`, providing the `WrappedAsset` to be burned. The state moves to `Burned`.
--- 5. The `notary` verifies the burn and exercises `UnlockSourceAsset` to release the original asset from the `SourceAssetLock`. The `BridgeNotary` contract is archived, completing the cycle.
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
 module BridgeNotary where
 
+import DA.Time (Time, RelTime, getTime, addRelTime, relTime)
 import Daml.Script
-import SourceLock (SourceAssetLock)
-import WrappedIOU (WrappedAsset)
 
--- | Represents the state of a cross-domain asset bridge operation.
-data BridgeStatus
-  = Locked   -- ^ Source asset is locked, awaiting minting on target domain.
-  | Minted   -- ^ Wrapped asset has been minted on the target domain.
-  | Burned   -- ^ Wrapped asset has been burned, awaiting source asset unlock.
-  deriving (Eq, Show)
-
--- | The central coordinating contract for the cross-domain bridge.
--- It is created after an asset has been locked on the source domain and
--- orchestrates the minting of a wrapped asset, and the eventual redemption
--- process (burn and unlock).
-template BridgeNotary
+-- | A placeholder for a generic IOU asset. In a production system, this would likely
+-- | be a standardized token template, such as one implementing Daml Finance interfaces.
+template Iou
   with
-    notary            : Party
-      -- ^ The party operating the bridge service.
-    owner             : Party
-      -- ^ The user who is bridging the asset.
-    sourceLockCid     : ContractId SourceAssetLock
-      -- ^ A reference to the locked asset on the source domain.
-    targetDomainId    : Text
-      -- ^ The identifier for the target Canton domain.
-    sourceAssetSymbol : Text
-      -- ^ The symbol of the original asset being bridged.
-    amount            : Decimal
-      -- ^ The amount of the asset being bridged.
-    status            : BridgeStatus
-      -- ^ The current state of the bridge process.
+    issuer: Party
+    owner: Party
+    symbol: Text
+    amount: Decimal
   where
-    signatory notary, owner
+    signatory issuer, owner
 
-    key (notary, owner, sourceLockCid) : (Party, Party, ContractId SourceAssetLock)
-    maintainer key._1
+    nonconsuming choice GetView: Iou
+      controller owner, issuer
+      do return self
 
-    -- | Asserts that the contract is in a valid state.
-    ensure
-      case status of
-        Locked -> True
-        Minted -> True
-        Burned -> True
-
-    -- | The notary mints the corresponding wrapped asset on the target domain.
-    -- This moves the status from `Locked` to `Minted`.
-    choice MintWrappedAsset : ContractId BridgeNotary
-      controller notary
-      do
-        assertMsg "Asset must be in 'Locked' state to be minted." (status == Locked)
-
-        -- In a real multi-domain setup, this would be a cross-domain call.
-        -- For this model, we simulate it by creating the WrappedAsset here.
-        -- The wrapped asset symbol is prefixed with 'w' to denote it's a wrapped version.
-        let wrappedSymbol = "w" <> sourceAssetSymbol
-        _ <- create WrappedAsset with
-              issuer = notary
-              owner = owner
-              symbol = wrappedSymbol
-              amount = amount
-              observers = []
-
-        create this with status = Minted
-
-    -- | The owner initiates redemption by providing the wrapped asset to be burned.
-    -- This moves the status from `Minted` to `Burned`.
-    choice InitiateRedemption : ContractId BridgeNotary
+    -- | Owner can lock their IOU to initiate a cross-domain bridge transfer.
+    -- | This consumes the IOU and creates an AssetLock contract.
+    choice LockForBridge : ContractId AssetLock
       with
-        wrappedAssetCid : ContractId WrappedAsset
+        notary: Party
+        targetRecipient: Party
       controller owner
       do
-        assertMsg "Asset must be in 'Minted' state to initiate redemption." (status == Minted)
+        now <- getTime
+        create AssetLock with
+          notary
+          owner
+          targetRecipient
+          assetIssuer = issuer
+          assetSymbol = symbol
+          assetAmount = amount
+          lockTime = now
 
-        -- Fetch and verify the wrapped asset before burning
-        wrappedAsset <- fetch wrappedAssetCid
-        assertMsg "Provided wrapped asset is not owned by you." (wrappedAsset.owner == owner)
-        assertMsg "Provided wrapped asset was not issued by the notary." (wrappedAsset.issuer == notary)
-        assertMsg "Wrapped asset amount does not match bridged amount." (wrappedAsset.amount == amount)
-        let wrappedSymbol = "w" <> sourceAssetSymbol
-        assertMsg "Wrapped asset symbol does not match bridged asset." (wrappedAsset.symbol == wrappedSymbol)
+-- | Establishes a party as a notary for the bridge, authorized by the operators
+-- | of the participating domains.
+template NotaryRole
+  with
+    notary: Party
+    sourceDomainOperator: Party
+    targetDomainOperator: Party
+    bridgeFee: Decimal
+  where
+    signatory notary, sourceDomainOperator, targetDomainOperator
 
-        exercise wrappedAssetCid WrappedAsset.Burn
+    key notary : Party
+    maintainer key
 
-        create this with status = Burned
+-- | Represents an asset locked on the source domain, awaiting processing by the notary.
+-- | The original asset contract is consumed to create this lock.
+template AssetLock
+  with
+    notary: Party
+    owner: Party          -- Original owner on the source domain
+    targetRecipient: Party -- Recipient on the target domain
+    assetIssuer: Party    -- Issuer of the original asset
+    assetSymbol: Text
+    assetAmount: Decimal
+    lockTime: Time        -- Timestamp when the asset was locked
+  where
+    signatory owner, assetIssuer
+    observer notary
 
-    -- | After the wrapped asset is burned, the notary unlocks the original asset
-    -- on the source domain. This completes the bridge-back process and archives
-    -- the BridgeNotary contract.
-    nonconsuming choice UnlockSourceAsset : ()
+    key (owner, assetIssuer, assetSymbol, lockTime) : (Party, Party, Text, Time)
+    maintainer key._1
+
+    -- | The notary processes the lock, which signals that a corresponding wrapped asset
+    -- | should be minted on the target domain. This archives the lock and creates a receipt.
+    choice ProcessLock : ContractId ProcessedLockReceipt
       controller notary
       do
-        assertMsg "Wrapped asset must be 'Burned' to unlock the source asset." (status == Burned)
-        exercise sourceLockCid SourceAssetLock.Unlock
+        processingTime <- getTime
+        create ProcessedLockReceipt with
+          notary
+          owner
+          targetRecipient
+          assetIssuer
+          assetSymbol
+          assetAmount
+          lockTime
+          processingTime
+
+    -- | If the notary fails to process the lock within 24 hours, the owner can reclaim
+    -- | their original asset. This choice becomes available only after the timeout has passed.
+    choice ReclaimOnTimeout : ContractId Iou
+      controller owner
+      do
+        -- Get the current ledger time to check against the timeout deadline.
+        now <- getTime
+
+        -- Calculate the deadline: lock time + 24 hours.
+        -- 24 hours = 24 * 60 * 60 = 86400 seconds.
+        let timeoutDuration : RelTime = relTime 86400 0
+        let timeoutDeadline = addRelTime lockTime timeoutDuration
+
+        -- Ensure the timeout period has elapsed before allowing the reclaim.
+        assertMsg
+          ("Timeout period has not yet elapsed. Asset can be reclaimed after " <> show timeoutDeadline)
+          (now > timeoutDeadline)
+
+        -- Re-create the original IOU for the owner, effectively refunding the asset.
+        create Iou with
+          issuer = assetIssuer
+          owner = owner
+          symbol = assetSymbol
+          amount = assetAmount
+
+-- | A receipt confirming that the notary has processed the lock. This contract would
+-- | typically be used as evidence on the target domain to authorize minting.
+template ProcessedLockReceipt
+  with
+    notary: Party
+    owner: Party
+    targetRecipient: Party
+    assetIssuer: Party
+    assetSymbol: Text
+    assetAmount: Decimal
+    lockTime: Time
+    processingTime: Time
+  where
+    signatory notary
+    observer owner, targetRecipient
+
+-- | Example script to demonstrate the timeout functionality.
+timeoutExample : Script ()
+timeoutExample = script do
+  -- 1. Allocate parties
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  bank <- allocateParty "Bank"
+  notary <- allocateParty "Notary"
+  sourceOp <- allocateParty "SourceDomainOperator"
+  targetOp <- allocateParty "TargetDomainOperator"
+
+  -- 2. Setup NotaryRole
+  _ <- submit notary do
+    createCmd NotaryRole with notary, sourceDomainOperator=sourceOp, targetDomainOperator=targetOp, bridgeFee = 0.0
+
+  -- 3. Issue an asset to Alice
+  iouCid <- submit bank do
+    createCmd Iou with issuer=bank, owner=alice, symbol="USD", amount=100.0
+
+  -- 4. Alice locks the asset for bridging to Bob on another domain
+  lockTime <- getTime
+  lockCid <- submit alice do
+    exerciseCmd iouCid LockForBridge with notary, targetRecipient = bob
+
+  -- 5. Advance time by 25 hours to simulate the timeout period passing.
+  -- Note: setTime is only available in scripts and testing, not in choices.
+  let futureTime = addRelTime lockTime (relTime (25 * 60 * 60) 0)
+  setTime futureTime
+
+  -- 6. Alice can now successfully reclaim her asset because the notary was unresponsive.
+  reclaimedIouCid <- submit alice do
+    exerciseCmd lockCid ReclaimOnTimeout
+
+  -- 7. Verify the reclaimed IOU has the correct details
+  reclaimedIou <- queryContractId alice reclaimedIouCid
+  assert (reclaimedIou.owner == alice)
+  assert (reclaimedIou.issuer == bank)
+  assert (reclaimedIou.amount == 100.0)
+
+  -- 8. Try to reclaim before timeout (this should fail)
+  -- Reset time and re-run lock
+  now <- getTime
+  setTime now
+  iouCid2 <- submit bank do
+    createCmd Iou with issuer=bank, owner=alice, symbol="USD", amount=50.0
+
+  lockCid2 <- submit alice do
+    exerciseCmd iouCid2 LockForBridge with notary, targetRecipient = bob
+
+  -- Attempt to reclaim immediately
+  submitMustFail alice do
+    exerciseCmd lockCid2 ReclaimOnTimeout
+
+  -- 9. Notary processes before timeout (this should succeed)
+  receiptCid <- submit notary do
+    exerciseCmd lockCid2 ProcessLock
+
+  -- After processing, Alice cannot reclaim because the lock contract is archived.
+  submitMustFail alice do
+    exerciseCmd lockCid2 ReclaimOnTimeout
+
+  return ()
