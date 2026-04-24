@@ -1,4 +1,4 @@
-sdk-version: 3.1.0
+sdk-version: 3.4.0
 name: canton-cross-chain-bridge
 version: 0.1.0
 source: daml
@@ -6,3 +6,14 @@ dependencies:
   - daml-prim
   - daml-stdlib
   - daml-script
+build-options:
+  - --target=2.1
+data-dependencies:
+# Example: Add dependency to a DAR file for a token standard
+#  - ../path/to/token.dar
+parties:
+  - Alice
+  - Bob
+  - SourceDomainOperator
+  - TargetDomainOperator
+  - Notary
