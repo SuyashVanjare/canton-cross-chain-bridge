@@ -1,105 +1,134 @@
+-- | This module defines the contracts and logic for locking an asset on a source
+-- | Canton domain as part of a cross-domain bridge transfer.
+-- |
+-- | The process involves two main states on the source domain:
+-- | 1.  `SourceLock`: An asset has been locked, awaiting confirmation from a notary
+-- |     that the corresponding wrapped asset has been minted on the target domain.
+-- |     This state has a timeout, allowing the original owner to reclaim their
+-- |     asset if the confirmation does not arrive in time.
+-- | 2.  `LockedAsset`: The minting has been confirmed. The asset is now held in
+-- |     escrow by the bridge operator until the notary signals that the wrapped
+-- |     asset has been burned on the target domain, at which point the original
+-- |     asset is unlocked and returned to its owner.
 module SourceLock where
 
-import DA.Time (Time, addRelTime, days)
+import DA.Time (Time)
 
--- | Represents an asset locked on the source domain, awaiting mint confirmation
--- from the bridge notary. The creation of this contract signifies the first step in
--- the cross-chain bridge process. The user's original asset contract is consumed
--- in the transaction that creates this `SourceLock`, effectively locking the value.
-template SourceLock
+-- | Represents the original asset that can be locked and unlocked.
+-- | In a real-world scenario, this would likely be a more complex IOU template
+-- | or a standard fungible token (e.g., implementing CIP-0056). For this
+-- | example, a simple asset representation is sufficient.
+template OriginalAsset
   with
-    owner: Party
-      -- ^ The owner of the asset being bridged.
-    notary: Party
-      -- ^ The bridge notary responsible for minting on the target domain.
-    assetSymbol: Text
-      -- ^ The symbol of the locked asset (e.g., "USDC").
-    assetQuantity: Decimal
-      -- ^ The amount of the asset locked.
-    targetDomainId: Text
-      -- ^ An identifier for the destination Canton domain.
-    targetRecipient: Party
-      -- ^ The party who will receive the wrapped asset on the target domain.
-    bridgeSessionId: Text
-      -- ^ A unique identifier for this bridge transaction to prevent replays and
-      -- facilitate tracking across domains.
-    lockedAt: Time
-      -- ^ The timestamp when the asset was locked.
+    issuer   : Party
+    owner    : Party
+    quantity : Decimal
+    symbol   : Text
   where
-    signatory owner
-    observer notary
+    signatory issuer
+    observer owner
 
-    key (owner, bridgeSessionId) : (Party, Text)
+    key (issuer, owner, symbol) : (Party, Party, Text)
     maintainer key._1
 
-    -- | The notary exercises this choice after successfully minting the corresponding
-    -- wrapped asset on the target domain. This transitions the state to await a
-    -- future burn-and-unlock event, creating a `PostMintConfirmation` contract.
-    choice NotaryConfirmMint : ContractId PostMintConfirmation
-      controller notary
-      do
-        create PostMintConfirmation with
-          owner
-          notary
-          assetSymbol
-          assetQuantity
-          targetDomainId
-          targetRecipient
-          bridgeSessionId
-          lockedAt
-
-    -- | An escape hatch for the owner to reclaim their locked asset if the notary
-    -- fails to confirm the mint within a specified timeout period (e.g., 24 hours).
-    -- Archiving this contract implies the asset is unlocked, and a script or
-    -- trigger would be responsible for recreating the original IOU contract.
-    choice ReclaimOnTimeout : ()
+    -- | A standard choice to transfer ownership of the asset. This is typically
+    -- | exercised by the owner to transfer the asset to the bridge operator
+    -- | as the first step of the bridging process.
+    choice Transfer : ContractId OriginalAsset
       with
-        currentTime: Time
-          -- ^ The current ledger time, provided by the caller.
+        newOwner : Party
       controller owner
       do
-        let timeout = days 1
-        let expiryTime = addRelTime lockedAt timeout
-        assertMsg "Cannot reclaim asset before the timeout period has expired." (currentTime >= expiryTime)
-        pure ()
+        create this with owner = newOwner
 
--- | Represents the state after a bridged asset has been minted on the target domain.
--- The original asset remains locked on the source domain, secured by this contract,
--- until proof of burn is provided from the target domain.
-template PostMintConfirmation
+-- | Represents an asset locked on the source domain, awaiting confirmation
+-- | from the notary that a corresponding wrapped asset has been minted on the
+-- | target domain. This contract is created atomically with the consumption
+-- | of the user's `OriginalAsset`, which is transferred to the operator.
+template SourceLock
   with
-    owner: Party
-      -- ^ The original owner of the asset.
-    notary: Party
-      -- ^ The bridge notary.
-    assetSymbol: Text
-      -- ^ The symbol of the locked asset.
-    assetQuantity: Decimal
-      -- ^ The amount of the asset locked.
-    targetDomainId: Text
-      -- ^ Identifier for the destination Canton domain where the asset was minted.
-    targetRecipient: Party
-      -- ^ The recipient on the target domain.
-    bridgeSessionId: Text
-      -- ^ The unique identifier for this bridge transaction.
-    lockedAt: Time
-      -- ^ The original lock timestamp.
+    operator        : Party   -- ^ The bridge operator.
+    notary          : Party   -- ^ The notary service that confirms cross-domain events.
+    originalOwner   : Party   -- ^ The user who initiated the bridge transfer.
+    issuer          : Party   -- ^ The issuer of the original asset.
+    quantity        : Decimal -- ^ The amount of the asset locked.
+    symbol          : Text    -- ^ The symbol of the asset.
+    targetRecipient : Party   -- ^ The party to receive the asset on the target domain.
+    sourceDomainId  : Text    -- ^ Identifier for the source domain.
+    targetDomainId  : Text    -- ^ Identifier for the target domain.
+    transactionId   : Text    -- ^ A unique ID for the bridge transaction.
+    timeout         : Time    -- ^ The absolute time after which the owner can reclaim the asset.
   where
-    signatory owner, notary
+    signatory operator, originalOwner
+    observer notary
 
-    key (owner, bridgeSessionId) : (Party, Text)
+    key (operator, transactionId) : (Party, Text)
     maintainer key._1
 
-    -- | The notary exercises this choice to unlock the original asset and return it
-    -- to the owner. This is done after verifying that the corresponding wrapped
-    -- asset has been burned on the target domain. Archiving this contract
-    -- completes the bridge round-trip, allowing a script or trigger to recreate
-    -- the original asset for the owner.
-    choice UnlockWithBurnProof : ()
-      with
-        burnProof: Text
-          -- ^ A reference or cryptographic proof of the burn transaction from
-          -- the target domain.
+    -- | Choice for the notary to confirm that the corresponding wrapped asset has
+    -- | been successfully minted on the target domain. This transitions the lock
+    -- | into a permanent `LockedAsset` state, awaiting a future unlock signal.
+    choice ConfirmMint : ContractId LockedAsset
       controller notary
       do
-        pure ()
+        create LockedAsset with
+          operator
+          notary
+          originalOwner
+          issuer
+          quantity
+          symbol
+          targetRecipient
+          sourceDomainId
+          targetDomainId
+          transactionId
+
+    -- | Choice for the original owner to reclaim their asset if the notary fails
+    -- | to confirm the mint before the timeout.
+    choice ReclaimAfterTimeout : ContractId OriginalAsset
+      controller originalOwner
+      do
+        t <- getTime
+        assertMsg "Timeout period has not yet elapsed. Cannot reclaim asset." (t >= timeout)
+
+        -- Recreate the original asset and return it to the owner.
+        create OriginalAsset with
+          issuer = self.issuer
+          owner = self.originalOwner
+          quantity = self.quantity
+          symbol = self.symbol
+
+-- | Represents an asset that is confirmed to be locked on the source domain,
+-- | with a corresponding wrapped asset minted on the target domain. It awaits
+-- | a signal from the notary to unlock, which occurs after the wrapped asset
+-- | is burned on the target domain.
+template LockedAsset
+  with
+    operator        : Party
+    notary          : Party
+    originalOwner   : Party
+    issuer          : Party
+    quantity        : Decimal
+    symbol          : Text
+    targetRecipient : Party
+    sourceDomainId  : Text
+    targetDomainId  : Text
+    transactionId   : Text
+  where
+    signatory operator
+    observer notary, originalOwner
+
+    key (operator, transactionId) : (Party, Text)
+    maintainer key._1
+
+    -- | Choice for the notary to signal that the wrapped asset has been burned
+    -- | on the target domain, thereby releasing the original asset back to its owner.
+    choice Unlock : ContractId OriginalAsset
+      controller notary
+      do
+        -- Recreate the original asset and return it to the owner.
+        create OriginalAsset with
+          issuer = self.issuer
+          owner = self.originalOwner
+          quantity = self.quantity
+          symbol = self.symbol
