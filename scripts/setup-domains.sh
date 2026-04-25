@@ -1,200 +1,220 @@
-#!/usr/bin/env bash
-
-# This script automates the setup of a local two-domain Canton network
-# for testing the canton-cross-chain-bridge project.
-#
-# It performs the following steps:
-# 1. Builds the Daml project to produce a DAR file.
-# 2. Creates a temporary directory (.canton-local) for Canton configuration and data.
-# 3. Generates a Canton configuration file for two participants and two domains.
-# 4. Generates a Canton bootstrap script to initialize the network, upload the DAR,
-#    and allocate necessary parties.
-# 5. Starts Canton in the background.
-# 6. Waits for the network to be ready and prints connection details.
-# 7. Tails the Canton log file. Press Ctrl+C to shut down and clean up.
+#!/bin/bash
 
 set -euo pipefail
 
 # --- Configuration ---
-# These should match the 'name' and 'version' in your daml.yaml
+CANTON_VERSION="3.4.0"
 PROJECT_NAME="canton-cross-chain-bridge"
 PROJECT_VERSION="0.1.0"
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+PROJECT_ROOT="$SCRIPT_DIR/.."
+DAR_PATH="$PROJECT_ROOT/.daml/dist/${PROJECT_NAME}-${PROJECT_VERSION}.dar"
+CONFIG_DIR="$SCRIPT_DIR/.generated-config"
+CONFIG_FILE="$CONFIG_DIR/bridge-dev.conf"
+SCRIPT_FILE="$CONFIG_DIR/bridge-dev.canton"
+PORT_DIR="$CONFIG_DIR/.ports"
+CANTON_PID_FILE="$CONFIG_DIR/canton.pid"
 
-# Directory for all Canton-related files and state
-CANTON_DIR=".canton-local"
+# Participant Ports
+P1_ADMIN_PORT=5012
+P1_LEDGER_API_PORT=6866
+P1_JSON_API_PORT=7575
+P2_ADMIN_PORT=5022
+P2_LEDGER_API_PORT=6876
+P2_JSON_API_PORT=7576
+P3_ADMIN_PORT=5032
+P3_LEDGER_API_PORT=6886
+P3_JSON_API_PORT=7577
 
-# File paths
-CANTON_LOG="${CANTON_DIR}/canton.log"
-CANTON_CONF="${CANTON_DIR}/bridge.conf"
-CANTON_BOOTSTRAP="${CANTON_DIR}/bootstrap.canton"
-
-# Network Ports
-SOURCE_PARTICIPANT_ADMIN_PORT=5012
-SOURCE_PARTICIPANT_LEDGER_PORT=6866
-TARGET_PARTICIPANT_ADMIN_PORT=5022
-TARGET_PARTICIPANT_LEDGER_PORT=6867
-
-# --- Cleanup Logic ---
-CANTON_PID=""
+# --- Helper Functions ---
 function cleanup {
-  if [ -n "$CANTON_PID" ]; then
-    echo ""
-    echo "Shutting down Canton network (PID: ${CANTON_PID})..."
-    kill "$CANTON_PID" || true
-    # Wait for the process to terminate gracefully
-    wait "$CANTON_PID" 2>/dev/null || true
+  echo "--- Shutting down Canton ---"
+  if [ -f "$CANTON_PID_FILE" ]; then
+    kill "$(cat "$CANTON_PID_FILE")" || true
+    rm -f "$CANTON_PID_FILE"
+  else
+    # Fallback if pid file wasn't created
+    pkill -f "bridge-dev.conf" || true
   fi
-  echo "Cleanup complete."
+  # Clean up generated files
+  rm -rf "$CONFIG_DIR"
+  echo "--- Cleanup complete ---"
 }
-trap cleanup EXIT INT TERM
+
+trap cleanup EXIT
 
 # --- Main Script ---
 
-echo "▶️  Building Daml project..."
-dpm build
+echo "--- Starting Canton Bridge Setup ---"
 
-DAR_PATH=$(find .daml/dist -name "${PROJECT_NAME}-${PROJECT_VERSION}.dar")
-if [ ! -f "$DAR_PATH" ]; then
-    echo "❌ Error: DAR file not found for ${PROJECT_NAME}-${PROJECT_VERSION}"
-    echo "Please check your daml.yaml configuration."
+# 1. Check prerequisites
+if ! command -v dpm &> /dev/null
+then
+    echo "DPM (dpm) command not found."
+    echo "Please install the Daml SDK version ${CANTON_VERSION} or later."
     exit 1
 fi
-# Canton requires an absolute path for DAR uploads in the bootstrap script.
-DAR_PATH_ABS=$(realpath "$DAR_PATH")
-echo "✅ Found DAR at: ${DAR_PATH_ABS}"
+if [ ! -f "$DAR_PATH" ]; then
+    echo "DAR file not found at: $DAR_PATH"
+    echo "Please build the project first by running 'dpm build' in the project root."
+    exit 1
+fi
+
+# 2. Prepare directories and kill any old processes
+echo "--- Preparing environment ---"
+cleanup # Run cleanup first to stop any lingering processes
+mkdir -p "$CONFIG_DIR"
+mkdir -p "$PORT_DIR"
 
 
-echo "▶️  Configuring local Canton environment in '${CANTON_DIR}'..."
-rm -rf "${CANTON_DIR}"
-mkdir -p "${CANTON_DIR}"
-
-
-echo "    - Generating Canton configuration file: ${CANTON_CONF}"
-cat > "${CANTON_CONF}" <<EOF
+# 3. Generate Canton configuration file
+echo "--- Generating Canton config file at $CONFIG_FILE ---"
+cat > "$CONFIG_FILE" << EOF
 // Canton configuration for a two-domain bridge setup
 canton {
   participants {
-    source-participant {
+    participant_source {
+      admin-api.port = ${P1_ADMIN_PORT}
+      ledger-api {
+        port = ${P1_LEDGER_API_PORT}
+        json-api.port = ${P1_JSON_API_PORT}
+        json-api.port-file = "${PORT_DIR}/participant_source.port"
+      }
       storage.type = memory
-      admin-api.port = ${SOURCE_PARTICIPANT_ADMIN_PORT}
-      ledger-api.port = ${SOURCE_PARTICIPANT_LEDGER_PORT}
     }
-    target-participant {
+    participant_target {
+      admin-api.port = ${P2_ADMIN_PORT}
+      ledger-api {
+        port = ${P2_LEDGER_API_PORT}
+        json-api.port = ${P2_JSON_API_PORT}
+        json-api.port-file = "${PORT_DIR}/participant_target.port"
+      }
       storage.type = memory
-      admin-api.port = ${TARGET_PARTICIPANT_ADMIN_PORT}
-      ledger-api.port = ${TARGET_PARTICIPANT_LEDGER_PORT}
+    }
+    participant_notary {
+      admin-api.port = ${P3_ADMIN_PORT}
+      ledger-api {
+        port = ${P3_LEDGER_API_PORT}
+        json-api.port = ${P3_JSON_API_PORT}
+        json-api.port-file = "${PORT_DIR}/participant_notary.port"
+      }
+      storage.type = memory
     }
   }
 
   domains {
-    source-domain {
+    source_domain {
       storage.type = memory
-      public-api.port = 5013
-      admin-api.port = 5014
-      mediator.admin-api.port = 5015
-      sequencer {
-        admin-api.port = 5016
-        public-api.port = 5017
-      }
+      public-api.port = 5014
+      admin-api.port = 5013
+      sequencer.type = in-process
+      mediator.type = in-process
     }
-    target-domain {
+    target_domain {
       storage.type = memory
-      public-api.port = 5023
-      admin-api.port = 5024
-      mediator.admin-api.port = 5025
-      sequencer {
-        admin-api.port = 5026
-        public-api.port = 5027
-      }
+      public-api.port = 5024
+      admin-api.port = 5023
+      sequencer.type = in-process
+      mediator.type = in-process
+    }
+    notary_domain {
+      storage.type = memory
+      public-api.port = 5034
+      admin-api.port = 5033
+      sequencer.type = in-process
+      mediator.type = in-process
     }
   }
 }
 EOF
 
+# 4. Generate Canton setup script
+echo "--- Generating Canton setup script at $SCRIPT_FILE ---"
+cat > "$SCRIPT_FILE" << EOF
+// Wait for all nodes to start
+println("Waiting for Canton nodes to start...")
+Seq(participant_source, participant_target, participant_notary, source_domain, target_domain, notary_domain).foreach(_.health.wait_for_running())
+println("All nodes are running.")
 
-echo "    - Generating Canton bootstrap script: ${CANTON_BOOTSTRAP}"
-cat > "${CANTON_BOOTSTRAP}" <<EOF
-// Canton bootstrap script for initializing the bridge network
-
-// Start all nodes defined in the config
-println("Starting all Canton nodes...")
-source_participant.start()
-target_participant.start()
-source_domain.start()
-target_domain.start()
-
-// Wait for them to be active
-println("Waiting for nodes to become active...")
-source_participant.health.wait_for_active()
-target_participant.health.wait_for_active()
-source_domain.health.wait_for_running()
-target_domain.health.wait_for_running()
-println("All nodes are active.")
-
-// Connect participants to their respective domains
+// Define domain IDs and connect participants
 println("Connecting participants to domains...")
-source_participant.domains.connect_local(source_domain)
-target_participant.domains.connect_local(target_domain)
-source_participant.domains.enable(source_domain.id)
-target_participant.domains.enable(target_domain.id)
-println("Domain connections enabled.")
+val sourceId = DomainId.tryFromString("source-domain::ffffffff")
+val targetId = DomainId.tryFromString("target-domain::ffffffff")
+val notaryId = DomainId.tryFromString("notary-domain::ffffffff")
 
-// Upload the DAR to both participants
+source_domain.domains.set_id(sourceId)
+target_domain.domains.set_id(targetId)
+notary_domain.domains.set_id(notaryId)
+
+source_domain.participants.connect(participant_source, ParticipantPermission.Submission)
+target_domain.participants.connect(participant_target, ParticipantPermission.Submission)
+
+// The notary needs to see both source and target domains
+source_domain.participants.connect(participant_notary, ParticipantPermission.Observation)
+target_domain.participants.connect(participant_notary, ParticipantPermission.Submission)
+notary_domain.participants.connect(participant_notary, ParticipantPermission.Submission)
+
+println("Enabling domains for participants...")
+participant_source.domains.enable(sourceId)
+participant_target.domains.enable(targetId)
+participant_notary.domains.enable(sourceId)
+participant_notary.domains.enable(targetId)
+participant_notary.domains.enable(notaryId)
+
+// Upload the bridge DAR to all participants
 println("Uploading DAR to participants...")
-source_participant.dars.upload("${DAR_PATH_ABS}", vetAllPackages = true)
-target_participant.dars.upload("${DAR_PATH_ABS}", vetAllPackages = true)
-println("DARs uploaded successfully.")
+val dar = καλύτερα.files.path_from_string("${DAR_PATH}")
+participant_source.dars.upload(dar)
+participant_target.dars.upload(dar)
+participant_notary.dars.upload(dar)
 
-// Allocate parties required for the bridge workflow
+// Allocate parties for the demo
 println("Allocating parties...")
-val alice = source_participant.parties.allocate(partyId="Alice", displayName="Alice")
-val notary = target_participant.parties.allocate(partyId="Notary", displayName="Notary")
-val bob = target_participant.parties.allocate(partyId="Bob", displayName="Bob")
-println("Parties allocated.")
+val alice = participant_source.parties.enable("Alice")
+val bob = participant_target.parties.enable("Bob")
+val bridgeOperator = participant_notary.parties.enable("BridgeOperator")
+val sourceBank = participant_source.parties.enable("SourceBank")
+val targetBank = participant_target.parties.enable("TargetBank")
 
-// Print out final connection details for other scripts and applications
-println("============================================================")
-println(" ✅ Canton Bridge Environment is Ready")
-println("============================================================")
-println(s"Source Participant (source-domain):")
-println(s"  - Ledger API Port:  ${SOURCE_PARTICIPANT_LEDGER_PORT}")
-println(s"  - Allocated Party:  \${alice.party} (Alice)")
-println(s"Target Participant (target-domain):")
-println(s"  - Ledger API Port:  ${TARGET_PARTICIPANT_LEDGER_PORT}")
-println(s"  - Allocated Parties: \${notary.party} (Notary)")
-println(s"                       \${bob.party} (Bob)")
-println("------------------------------------------------------------")
-println(" Log file available at: ${CANTON_LOG}")
-println(" Press Ctrl+C to shut down the network.")
-println("============================================================")
+// --- Setup Complete ---
+println("\n" + "="*50)
+println("CANTON BRIDGE ENVIRONMENT IS READY")
+println("="*50 + "\n")
+
+println("Participants:")
+println(s"  - Source Participant Ledger API:  localhost:${P1_LEDGER_API_PORT}")
+println(s"  - Source Participant JSON API:    http://localhost:${P1_JSON_API_PORT}")
+println(s"  - Target Participant Ledger API:  localhost:${P2_LEDGER_API_PORT}")
+println(s"  - Target Participant JSON API:    http://localhost:${P2_JSON_API_PORT}")
+println(s"  - Notary Participant Ledger API:  localhost:${P3_LEDGER_API_PORT}")
+println(s"  - Notary Participant JSON API:    http://localhost:${P3_JSON_API_PORT}")
+println("\nParties:")
+println(s"  - Alice:        \${alice.toLf} (hosted on Source Participant)")
+println(s"  - Bob:          \${bob.toLf} (hosted on Target Participant)")
+println(s"  - BridgeOperator: \${bridgeOperator.toLf} (hosted on Notary Participant)")
+println(s"  - SourceBank:     \${sourceBank.toLf} (hosted on Source Participant)")
+println(s"  - TargetBank:     \${targetBank.toLf} (hosted on Target Participant)")
+println("\n" + "="*50)
+println("Press Ctrl+C to shut down.")
 EOF
 
+# 5. Start Canton in the background
+echo "--- Starting Canton process ---"
+# The --bootstrap-script option will automatically run the script when Canton is ready.
+# This is more reliable than using sleep and a separate `canton --script` command.
+dpm canton -- \
+  -c "$CONFIG_FILE" \
+  --bootstrap-script "$SCRIPT_FILE" \
+  --bootstrap-script-config.timeout=60s \
+  &
 
-echo "▶️  Starting Canton network in the background..."
-# Start Canton, redirecting all output to the log file.
-# The '&' runs it in the background.
-canton -c "${CANTON_CONF}" --bootstrap "${CANTON_BOOTSTRAP}" > "${CANTON_LOG}" 2>&1 &
 CANTON_PID=$!
-echo "✅ Canton process started with PID: ${CANTON_PID}"
+echo "$CANTON_PID" > "$CANTON_PID_FILE"
+echo "--- Canton process started with PID $CANTON_PID ---"
+echo "--- Waiting for bootstrap to complete (see Canton logs) ---"
 
-echo "▶️  Waiting for network setup to complete... (this may take a minute)"
-# Wait for the success message from our bootstrap script to appear in the log.
-# This is a robust way to know the network is fully initialized.
-# Timeout after 2 minutes to prevent hanging indefinitely.
-if timeout 120s tail -f "${CANTON_LOG}" | grep -qe "Press Ctrl+C to shut down the network."; then
-    # Clear the line from tail/grep and show final status
-    echo ""
-    echo "✅ Network is up and running."
-    echo ""
-else
-    echo "❌ Canton startup timed out after 120 seconds."
-    echo "    Please check the log file for errors: ${CANTON_LOG}"
-    exit 1
-fi
-
-# Keep this script running to hold the Canton process.
-# When the user hits Ctrl+C, the trap will execute the cleanup function.
-echo "Tailing Canton log. Press Ctrl+C to stop."
-echo "------------------------------------------"
-tail -f "${CANTON_LOG}" &
+# 6. Wait for the Canton process to exit
 wait "$CANTON_PID"
+exit_code=$?
+echo "--- Canton process exited with code $exit_code ---"
+exit $exit_code
