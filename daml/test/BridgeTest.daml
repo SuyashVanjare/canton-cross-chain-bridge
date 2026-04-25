@@ -4,107 +4,205 @@
 module BridgeTest where
 
 import Daml.Script
+import qualified DA.Assert as A
 
-import SourceLock
-import WrappedIOU
-import BridgeNotary
-import BurnRedemption
+-- Module imports from the cross-chain bridge implementation.
+-- These are assumed to be in the `daml` source directory.
+import SourceChain.Bridge
+import SourceChain.Iou
+import TargetChain.Bridge
+import TargetChain.Wrapped
+import Common.Asset
 
--- | A full round-trip test of the cross-domain bridge.
--- This script simulates the entire lifecycle:
--- 1. An asset is locked on the source "domain".
--- 2. A wrapped IOU is minted on the target "domain" by a notary.
--- 3. The owner of the wrapped IOU burns it to initiate redemption.
--- 4. The notary confirms the burn, completing the process and "unlocking" the original asset.
-test_full_bridge_round_trip : Script ()
-test_full_bridge_round_trip = script do
-  -- === 1. SETUP: ALLOCATE PARTIES AND ROLES ===
-  debug "Setting up parties for the bridge test..."
-  sourceOwner <- allocatePartyWithHint "SourceOwner" (PartyIdHint "sourceowner")
-  targetOwner <- allocatePartyWithHint "TargetOwner" (PartyIdHint "targetowner")
-  notary      <- allocatePartyWithHint "Notary" (PartyIdHint "notary")
-  operator    <- allocatePartyWithHint "Operator" (PartyIdHint "operator")
+-- | Sets up the core parties for the bridge tests.
+-- In a real multi-domain setup, these parties would exist on different participants
+-- and potentially different domains. For a single-participant script test, we can
+-- allocate them all in the same context.
+setupParties = script do
+  user <- allocatePartyWithHint "User" (PartyIdHint "user")
+  sourceLockbox <- allocatePartyWithHint "SourceLockbox" (PartyIdHint "sourceLockbox")
+  targetNotary <- allocatePartyWithHint "TargetNotary" (PartyIdHint "targetNotary")
+  targetIssuer <- allocatePartyWithHint "TargetIssuer" (PartyIdHint "targetIssuer")
+  pure (user, sourceLockbox, targetNotary, targetIssuer)
 
-  -- The Notary and Operator establish a role contract that governs minting.
-  notaryRoleCid <- submit notary do
-    createCmd NotaryRole with notary, operator
-
-  debug $ "Parties allocated and NotaryRole created: " <> show notaryRoleCid
-
-  -- === 2. LOCK: SOURCE OWNER LOCKS AN ASSET ===
-  debug "Source owner is locking an asset..."
+-- | Sets up the initial on-ledger state required for the bridge to operate.
+-- This includes roles, asset registrations, and the initial IOU for the user.
+setupInitialState (user, sourceLockbox, targetNotary, targetIssuer) = script do
+  -- Define asset types for both source and target chains
   let
-    initialAmount = 1000.0
-    assetSymbol = "SRC_ASSET"
+    sourceAsset = AssetType with issuer = sourceLockbox, symbol = "sUSD", isFungible = True
+    targetAsset = AssetType with issuer = targetIssuer, symbol = "wsUSD", isFungible = True
+    bridgeableAmount = 1000.0
 
-  sourceLockCid <- submit sourceOwner do
-    createCmd SourceLock with
-      sourceOwner
-      targetOwner
-      operator
-      notary
-      amount = initialAmount
-      assetSymbol
+  -- 1. Setup Source Chain contracts
+  submit sourceLockbox do createCmd AssetRegistration with operator = sourceLockbox, asset = sourceAsset
+  lockboxCid <- submit sourceLockbox do createCmd Lockbox with operator = sourceLockbox
+  userIouCid <- submit sourceLockbox do createCmd Iou with asset = sourceAsset, owner = user, quantity = bridgeableAmount
 
-  -- The off-chain operator component would observe this contract creation.
-  -- We simulate this by fetching the contract as the operator to ensure visibility.
-  (fetchedLockCid, sourceLock) <- fetchContract sourceLockCid operator
-  assert (sourceLock.targetOwner == targetOwner)
-  assert (sourceLock.amount == initialAmount)
-  debug $ "Asset locked successfully in contract: " <> show fetchedLockCid
+  -- 2. Setup Target Chain contracts
+  let observers = [user, targetIssuer, sourceLockbox]
+  notaryRoleCid <- submit targetNotary do createCmd NotaryRole with notary = targetNotary, observers
+  issuerRoleCid <- submit targetIssuer do createCmd IssuerRole with issuer = targetIssuer, notary = targetNotary, observers = [user]
+  assetMappingCid <- submit targetNotary do createCmd AssetMapping with notary = targetNotary, sourceAsset, targetAsset, observers
 
-  -- === 3. MINT: OPERATOR REQUESTS MINTING OF WRAPPED IOU ===
-  debug "Operator is requesting the notary to mint a wrapped IOU..."
-  -- This choice consumes the SourceLock contract to prevent double-minting
-  -- and creates the WrappedIOU contract on the target "domain".
-  wrappedIouCid <- submit operator do
-    exerciseCmd notaryRoleCid RequestMintWrappedIOU with sourceLockCid
+  pure (lockboxCid, userIouCid, notaryRoleCid, assetMappingCid, sourceAsset, targetAsset, bridgeableAmount)
 
-  -- Verify the SourceLock contract was consumed. This is a critical check
-  -- to ensure assets cannot be minted twice from the same lock.
-  debug "Verifying that the original SourceLock contract has been archived..."
-  submitMustFail operator do
-    fetchCmd sourceLockCid
 
-  -- The target owner should now have a WrappedIOU contract.
-  (fetchedIouCid, wrappedIou) <- fetchContract wrappedIouCid targetOwner
-  assert (wrappedIou.owner == targetOwner)
-  assert (wrappedIou.notary == notary)
-  assert (wrappedIou.amount == initialAmount)
-  assert (wrappedIou.assetSymbol == assetSymbol)
-  assert (wrappedIou.sourceLockCid == sourceLockCid)
-  debug $ "Wrapped IOU minted successfully for target owner: " <> show fetchedIouCid
+-- | Test the full, successful round trip of an asset:
+--   1. Lock on the source chain.
+--   2. Mint on the target chain.
+--   3. Burn on the target chain.
+--   4. Unlock on the source chain.
+test_full_round_trip = script do
+  parties@(user, _, targetIssuer, _) <- setupParties
+  (lockboxCid, userIouCid, notaryRoleCid, assetMappingCid, sourceAsset, targetAsset, bridgeableAmount) <- setupInitialState parties
 
-  -- === 4. BURN: TARGET OWNER REQUESTS REDEMPTION ===
-  debug "Target owner is burning the wrapped IOU to redeem the original asset..."
-  -- The owner of the wrapped IOU initiates the burn process.
-  -- This consumes the WrappedIOU and creates a BurnRedemption request for the notary.
-  burnRedemptionCid <- submit targetOwner do
-    exerciseCmd wrappedIouCid RequestBurn
+  debug "Test: Full Round Trip - Starting"
 
-  -- Verify the WrappedIOU contract was consumed.
-  debug "Verifying that the WrappedIOU contract has been archived..."
-  submitMustFail targetOwner do
-    fetchCmd wrappedIouCid
+  -- Step 1: User locks their asset on the source chain.
+  -- This consumes the user's IOU and creates a `LockedAsset` contract as proof.
+  debug "Step 1: User locking asset on source chain..."
+  (lockedAssetCid, originalIou) <- submit user do
+    exerciseCmd lockboxCid Lock with
+      iouCid = userIouCid
+      targetChainRecipient = user
 
-  -- The notary should now see a burn redemption request.
-  (fetchedRedemptionCid, burnRedemption) <- fetchContract burnRedemptionCid notary
-  assert (burnRedemption.redeemer == targetOwner)
-  assert (burnRedemption.notary == notary)
-  assert (burnRedemption.sourceLockCid == sourceLockCid)
-  debug $ "BurnRedemption request created for the notary: " <> show fetchedRedemptionCid
+  -- Assertions for Step 1
+  lockedAsset <- fetch lockedAssetCid
+  A.assertEq lockedAsset.originalOwner user
+  A.assertEq lockedAsset.asset sourceAsset
+  A.assertEq lockedAsset.quantity bridgeableAmount
+  A.assertEq originalIou.owner user
+  (query @Iou user) >>= A.assertEq []
+  debug "Step 1 complete: Asset locked, LockedAsset contract created."
 
-  -- === 5. UNLOCK: NOTARY CONFIRMS BURN AND COMPLETES CYCLE ===
-  debug "Notary is confirming the burn and completing the cycle..."
-  -- The notary confirms they have witnessed the burn and finalizes the process.
-  -- In this IOU model, this archives the final contract in the chain,
-  -- representing the "unlocking" of the source asset (i.e., the liability is extinguished).
-  submit notary do
-    exerciseCmd burnRedemptionCid ConfirmBurnAndUnlock
+  -- Step 2: User requests minting of the wrapped asset on the target chain.
+  -- The Notary acknowledges the lock proof and authorizes the Issuer to mint.
+  debug "Step 2: User requesting mint on target chain..."
+  mintAuthCid <- submit user do
+    exerciseCmd notaryRoleCid AcknowledgeLockAndAuthorizeMint with
+      lockedAssetCid
+      mappingCid = assetMappingCid
 
-  -- Verify the BurnRedemption contract was consumed, completing the round trip.
-  debug "Verifying that the BurnRedemption contract has been archived..."
-  submitMustFail notary do
-    fetchCmd burnRedemptionCid
+  wrappedAssetCid <- submit targetIssuer do
+    exerciseCmd mintAuthCid MintWrappedAsset
 
-  debug "SUCCESS: Bridge round-trip completed successfully."
+  -- Assertions for Step 2
+  wrappedAsset <- fetch wrappedAssetCid
+  A.assertEq wrappedAsset.asset targetAsset
+  A.assertEq wrappedAsset.owner user
+  A.assertEq wrappedAsset.quantity bridgeableAmount
+  A.assertContractDoesNotExist @MintAuthorization mintAuthCid user
+  debug "Step 2 complete: Wrapped asset minted for user."
+
+  -- Step 3: User burns the wrapped asset on the target chain.
+  -- This creates a `BurnReceipt` which serves as proof for the unlock step.
+  debug "Step 3: User burning wrapped asset on target chain..."
+  burnReceiptCid <- submit user do
+    exerciseCmd wrappedAssetCid RequestBurn with
+      sourceChainRecipient = user
+
+  -- Assertions for Step 3
+  burnReceipt <- fetch burnReceiptCid
+  A.assertEq burnReceipt.recipient user
+  A.assertEq burnReceipt.sourceAsset sourceAsset
+  A.assertEq burnReceipt.quantity bridgeableAmount
+  A.assertContractDoesNotExist @Asset wrappedAssetCid user
+  debug "Step 3 complete: Wrapped asset burned, BurnReceipt created."
+
+  -- Step 4: User unlocks their original asset on the source chain.
+  -- The user presents the `BurnReceipt` to the `LockedAsset` contract.
+  debug "Step 4: User unlocking original asset on source chain..."
+  unlockedIouCid <- submit user do
+    exerciseCmd lockedAssetCid Unlock with
+      burnReceiptCid
+
+  -- Assertions for Step 4
+  unlockedIou <- fetch unlockedIouCid
+  A.assertEq unlockedIou.owner user
+  A.assertEq unlockedIou.asset sourceAsset
+  A.assertEq unlockedIou.quantity bridgeableAmount
+  A.assertContractDoesNotExist @LockedAsset lockedAssetCid user
+  ious <- query @Iou user
+  A.assertEq (length ious) 1
+  debug "Step 4 complete: Original asset unlocked. Round trip successful."
+
+
+-- | Test that the bridge correctly prevents a double-mint from the same lock proof.
+-- This is critical for preventing asset inflation.
+test_prevent_double_mint = script do
+  parties@(user, _, targetIssuer, _) <- setupParties
+  (lockboxCid, userIouCid, notaryRoleCid, assetMappingCid, _, _, _) <- setupInitialState parties
+
+  debug "Test: Prevent Double Mint - Starting"
+
+  -- Lock asset
+  (lockedAssetCid, _) <- submit user do
+    exerciseCmd lockboxCid Lock with iouCid = userIouCid, targetChainRecipient = user
+
+  -- First mint attempt - should succeed
+  debug "Attempting first mint..."
+  mintAuthCid1 <- submit user do
+    exerciseCmd notaryRoleCid AcknowledgeLockAndAuthorizeMint with lockedAssetCid, mappingCid = assetMappingCid
+  _ <- submit targetIssuer do
+    exerciseCmd mintAuthCid1 MintWrappedAsset
+  debug "First mint successful."
+
+  -- Second mint attempt with the same lock proof - should fail
+  debug "Attempting second mint with the same lock proof..."
+  submitMustFail user do
+    exerciseCmd notaryRoleCid AcknowledgeLockAndAuthorizeMint with lockedAssetCid, mappingCid
+  debug "Second mint correctly failed as expected."
+
+
+-- | Test that a user cannot unlock their assets using another user's burn receipt.
+-- This ensures that only the rightful owner can reclaim locked assets.
+test_unlock_with_wrong_receipt = script do
+  parties@(user1, sourceLockbox, targetNotary, targetIssuer) <- setupParties
+  user2 <- allocatePartyWithHint "User2" (PartyIdHint "user2")
+
+  debug "Test: Unlock With Wrong Receipt - Starting"
+
+  -- Basic setup for two users
+  let sourceAsset = AssetType with issuer = sourceLockbox, symbol = "sUSD", isFungible = True
+  let targetAsset = AssetType with issuer = targetIssuer, symbol = "wsUSD", isFungible = True
+  let observers = [user1, user2, targetIssuer, sourceLockbox]
+  lockboxCid <- submit sourceLockbox do createCmd Lockbox with operator = sourceLockbox
+  notaryRoleCid <- submit targetNotary do createCmd NotaryRole with notary = targetNotary, observers
+  assetMappingCid <- submit targetNotary do createCmd AssetMapping with notary = targetNotary, sourceAsset, targetAsset, observers
+  submit targetIssuer do createCmd IssuerRole with issuer = targetIssuer, notary = targetNotary, observers
+
+  -- Create and lock assets for both users
+  user1IouCid <- submit sourceLockbox do createCmd Iou with asset = sourceAsset, owner = user1, quantity = 100.0
+  user2IouCid <- submit sourceLockbox do createCmd Iou with asset = sourceAsset, owner = user2, quantity = 200.0
+  (lockedAsset1Cid, _) <- submit user1 do exerciseCmd lockboxCid Lock with iouCid = user1IouCid, targetChainRecipient = user1
+  (lockedAsset2Cid, _) <- submit user2 do exerciseCmd lockboxCid Lock with iouCid = user2IouCid, targetChainRecipient = user2
+
+  -- Mint and burn for both users to generate two distinct burn receipts
+  mintAuth1Cid <- submit user1 do exerciseCmd notaryRoleCid AcknowledgeLockAndAuthorizeMint with lockedAssetCid = lockedAsset1Cid, mappingCid = assetMappingCid
+  mintAuth2Cid <- submit user2 do exerciseCmd notaryRoleCid AcknowledgeLockAndAuthorizeMint with lockedAssetCid = lockedAsset2Cid, mappingCid = assetMappingCid
+  wrappedAsset1Cid <- submit targetIssuer do exerciseCmd mintAuth1Cid MintWrappedAsset
+  wrappedAsset2Cid <- submit targetIssuer do exerciseCmd mintAuth2Cid MintWrappedAsset
+  burnReceipt1Cid <- submit user1 do exerciseCmd wrappedAsset1Cid RequestBurn with sourceChainRecipient = user1
+  burnReceipt2Cid <- submit user2 do exerciseCmd wrappedAsset2Cid RequestBurn with sourceChainRecipient = user2
+
+  -- User 1 tries to unlock their asset using User 2's burn receipt. This must fail.
+  debug "User 1 attempting to unlock with User 2's burn receipt..."
+  submitMustFail user1 do
+    exerciseCmd lockedAsset1Cid Unlock with
+      burnReceiptCid = burnReceipt2Cid
+  debug "Unlock correctly failed due to mismatched burn receipt."
+
+  -- User 1 successfully unlocks with their own receipt to confirm validity.
+  debug "User 1 attempting to unlock with their own receipt..."
+  _ <- submit user1 do
+    exerciseCmd lockedAsset1Cid Unlock with
+      burnReceiptCid = burnReceipt1Cid
+  debug "User 1 successfully unlocked. Test complete."
+
+
+-- | Main entry point for running all bridge tests.
+tests = script do
+  test_full_round_trip
+  test_prevent_double_mint
+  test_unlock_with_wrong_receipt
