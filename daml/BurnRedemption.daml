@@ -1,71 +1,78 @@
 -- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 -- SPDX-License-Identifier: Apache-2.0
 
-module BurnRedemption where
+module Bridge.BurnRedemption where
 
-import Daml.Script
 import DA.Time (Time, getTime)
-import Canton.MultiDomain (submitMultiDomain)
-import Canton.Types (DomainId)
-import SourceLock (SourceLock)
-import WrappedIOU (WrappedIOU)
+import DA.Assert (assertMsg)
+import Daml.Finance.Interface.Asset.Fungible qualified as Fungible (I)
+import Bridge.Asset (Asset)
 
--- | Represents a pending request to redeem a wrapped asset. The owner has
--- | committed their `WrappedIOU` to be burned, in exchange for the notary
--- | unlocking the original asset on the source domain. This contract acts as
--- | a multi-domain instruction with a timeout.
+-- | Defines the interface for a contract that can lock an asset and subsequently
+-- | unlock it for a designated owner or allow an operator to reclaim it.
+-- | This decouples the redemption process from the specific implementation of the asset lock.
+interface AssetLocker where
+  viewtype V = AssetLockerView
+    with
+      operator : Party
+        -- ^ The bridge operator.
+      owner : Party
+        -- ^ The original owner of the locked asset.
+      asset : Asset
+        -- ^ The asset being locked.
+
+  -- | Unlocks the asset and transfers it to the new owner.
+  -- | This method is typically called by the original owner.
+  method unlock : Party -> Update (ContractId Fungible.I)
+
+  -- | Allows the operator to reclaim the locked asset.
+  -- | This is typically used in timeout or error-recovery scenarios.
+  method reclaim : Update (ContractId Fungible.I)
+
+
+-- | Represents a claim to unlock an asset on a source domain, created after a corresponding
+-- | wrapped asset has been burned on a target domain. This contract acts as a proof-of-burn
+-- | and orchestrates the final step of the redemption process.
+-- | The `redeemer` has a limited time window to claim their original asset before the
+-- | `operator` can reclaim it to prevent assets from being stuck.
 template BurnRedemption
   with
-    owner: Party
-      -- ^ The owner of the wrapped asset, initiating the redemption.
-    notary: Party
-      -- ^ The bridge notary responsible for coordinating the burn and unlock.
-    sourceDomainId: DomainId
-      -- ^ The domain where the original asset is locked.
-    sourceLockCid: ContractId SourceLock
-      -- ^ The contract holding the locked asset on the source domain.
-    wrappedIouCid: ContractId WrappedIOU
-      -- ^ The wrapped IOU contract to be burned on the target domain.
-    deadline: Time
-      -- ^ A timeout, after which the owner can reclaim their IOU if the notary
-      -- ^ has not processed the redemption.
+    operator : Party
+      -- ^ The party operating the bridge.
+    redeemer : Party
+      -- ^ The party who burned the wrapped asset and is entitled to the original.
+    lockerCid : ContractId AssetLocker
+      -- ^ The contract ID of the `AssetLock` holding the original asset.
+    timeout : Time
+      -- ^ The timestamp after which the operator can reclaim the locked asset.
   where
-    signatory owner
-    observer notary
+    signatory operator, redeemer
 
-    key (owner, notary, sourceLockCid) : (Party, Party, ContractId SourceLock)
+    key (operator, redeemer, lockerCid) : (Party, Party, ContractId AssetLocker)
     maintainer key._1
 
-    -- | The notary executes the burn-and-unlock process. This choice is atomic
-    -- | across the source and target domains. It first burns the `WrappedIOU` on
-    -- | the current (target) domain, and then submits a command to the source
-    -- | domain to unlock the original `SourceLock` contract.
-    choice AcknowledgeBurnAndUnlock : ()
-      controller notary
+    -- | Allows the redeemer to claim the original locked asset.
+    -- | This action exercises the `unlock` method on the associated `AssetLock` contract.
+    choice Claim : ContractId Fungible.I
+      controller redeemer
       do
-        -- Step 1: Burn the IOU on the target domain (this domain).
-        -- The `owner` is a signatory on this contract, so the `notary` (as controller)
-        -- can exercise the `Burn` choice on the owner's behalf.
-        exercise wrappedIouCid Burn
+        -- Fetch the locker contract's view to verify the redeemer is the original owner.
+        -- This is a critical security check to ensure the right party claims the asset.
+        lockerView <- view lockerCid
+        assertMsg "The redeemer is not the original owner of the locked asset."
+          (lockerView.owner == redeemer)
 
-        -- Step 2: Instruct the source domain to unlock the original asset.
-        -- This uses Canton's multi-domain submission feature to ensure atomicity.
-        -- If the `Unlock` fails on the source domain for any reason (e.g., lack of
-        -- authorization, contract already archived), the `Burn` on this domain
-        -- is also rolled back. The `notary` must be a controller on the `Unlock`
-        -- choice on the `SourceLock` template for this to succeed.
-        submitMultiDomain sourceDomainId do
-          exercise sourceLockCid Unlock
+        -- Call the unlock method on the locker contract to release the asset to the redeemer.
+        call lockerCid.unlock redeemer
 
-        return ()
-
-    -- | If the notary fails to act before the deadline, the owner can cancel
-    -- | the redemption request. This archives the `BurnRedemption` contract,
-    -- | but leaves the `WrappedIOU` contract active, allowing the owner to
-    -- | retry the process or continue using the wrapped asset.
-    choice Reclaim : ()
-      controller owner
+    -- | Allows the bridge operator to reclaim the locked asset if the redeemer
+    -- | fails to claim it before the timeout. This prevents assets from being
+    -- | permanently locked due to user inaction.
+    choice Reclaim : ContractId Fungible.I
+      controller operator
       do
         now <- getTime
-        assertMsg "Cannot reclaim before the deadline has passed" (now >= deadline)
-        return ()
+        assertMsg "Reclaim period has not yet been reached." (now >= timeout)
+
+        -- Call the reclaim method on the locker contract, returning the asset to operator control.
+        call lockerCid.reclaim
