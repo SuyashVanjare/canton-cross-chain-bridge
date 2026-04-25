@@ -1,179 +1,126 @@
--- |
 -- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 -- SPDX-License-Identifier: Apache-2.0
---
 
-module Canton.Bridge.WrappedIOU where
+module WrappedIOU where
 
 import Daml.Script
-import DA.Exception
 
--- | Details of the original asset locked on the source domain.
--- This data is carried over to the target domain to facilitate redemption.
-data OriginalAssetDetails = OriginalAssetDetails with
-  issuer : Party         -- ^ Original issuer of the asset on the source domain.
-  originalOwner: Party   -- ^ The party on the source domain who can claim the unlocked asset.
-  symbol : Text          -- ^ Ticker symbol of the asset (e.g., "BTC", "USD").
-  sourceDomainId : Text  -- ^ Identifier for the source Canton domain.
-  deriving (Eq, Show)
-
--- | Represents a wrapped asset (IOU) on the target domain, backed by a
--- corresponding asset locked on the source domain. Each IOU is tied to a
--- specific lock event, identified by `sourceLockId`.
+-- | Represents a wrapped IOU on a target Canton domain.
+-- This contract is created by the `Notary` when a corresponding asset is locked on a source domain.
+-- It functions as a standard IOU within its domain, allowing transfers between parties.
+-- To redeem the original asset, the `owner` must exercise the `Burn` choice,
+-- which archives this contract. A bridge-specific trigger or automation process is expected to
+-- observe this archival and initiate the unlocking of the original asset on the source domain.
 template WrappedIOU
   with
-    issuer: Party        -- ^ The notary/bridge operator who mints the IOU.
-    owner: Party         -- ^ The current holder of the wrapped asset.
+    issuer: Party
+      -- ^ The party issuing the IOU, which is the Bridge Notary.
+    owner: Party
+      -- ^ The current owner of the wrapped asset.
     quantity: Decimal
-    originalAsset: OriginalAssetDetails
-    sourceLockId: Text   -- ^ Unique identifier of the lock contract on the source domain.
+      -- ^ The amount of the wrapped asset. Must be positive.
+    description: Text
+      -- ^ A human-readable description of the underlying asset, e.g., "Wrapped ETH on DevNet".
+    sourceDomainId: Text
+      -- ^ A unique identifier for the source Canton domain where the original asset is locked.
+    originalAssetId: Text
+      -- ^ A unique identifier for the original locked asset on the source domain.
+      -- This is used to correlate the burn event with the correct unlock action.
+    notary: Party
+      -- ^ The bridge operator responsible for the mint/burn process. Must be the same as the issuer.
   where
     signatory issuer, owner
-    observer issuer
-
-    key (issuer, owner, sourceLockId) : (Party, Party, Text)
-    maintainer key._1
 
     ensure quantity > 0.0
+    ensure issuer == notary
 
-    -- | Transfer the entire IOU to a new owner.
+    key (issuer, owner, sourceDomainId, originalAssetId) : (Party, Party, Text, Text)
+    maintainer key._1
+
+    -- | Transfers the wrapped IOU to a new owner.
+    -- This archives the existing IOU and creates an identical one for the `newOwner`.
     choice Transfer : ContractId WrappedIOU
       with
         newOwner : Party
+          -- ^ The party to receive the IOU.
       controller owner
       do
+        assertMsg "New owner cannot be the same as the current owner." (newOwner /= owner)
         create this with owner = newOwner
 
-    -- | Split the IOU into two smaller amounts. Both new IOUs will point to the
-    -- same source lock, allowing for partial redemptions to be tracked by the issuer.
-    choice Split : (ContractId WrappedIOU, ContractId WrappedIOU)
-      with
-        splitQuantity : Decimal
-      controller owner
+    -- | Allows authorized parties to view the details of the IOU without exposing the contract ID.
+    nonconsuming choice GetView : View
+      controller owner, issuer
       do
-        assertMsg "Split quantity must be positive" $ splitQuantity > 0.0
-        assertMsg "Split quantity must be less than the IOU's total quantity" $ splitQuantity < quantity
-        let remainingQuantity = quantity - splitQuantity
-        cid1 <- create this with quantity = splitQuantity
-        cid2 <- create this with quantity = remainingQuantity
-        return (cid1, cid2)
-
-    -- | The owner initiates the process to redeem the wrapped asset for the
-    -- original underlying asset on the source domain. This creates a request
-    -- for the issuer to process.
-    nonconsuming choice RequestRedemption : ContractId RedemptionRequest
-      controller owner
-      do
-        create RedemptionRequest with
-          requester = owner
+        return View with
           issuer = issuer
-          wrappedIouCid = self
+          owner = owner
           quantity = quantity
-          originalAsset = originalAsset
-          sourceLockId = sourceLockId
+          description = description
+          sourceDomainId = sourceDomainId
+          originalAssetId = originalAssetId
 
--- | A request from a user to the notary/bridge operator to burn a `WrappedIOU`
--- and release the corresponding locked asset on the source domain.
-template RedemptionRequest
-  with
-    requester: Party     -- ^ The owner of the wrapped IOU requesting redemption.
-    issuer: Party        -- ^ The notary/bridge operator.
-    wrappedIouCid : ContractId WrappedIOU -- ^ The specific IOU to be burned.
-    quantity : Decimal
-    originalAsset : OriginalAssetDetails
-    sourceLockId : Text
-  where
-    signatory requester
-    observer issuer
-
-    key (issuer, requester, sourceLockId) : (Party, Party, Text)
-    maintainer key._1
-
-    -- | Allows the requester to cancel their redemption request before it is
-    -- processed by the issuer.
-    choice CancelRedemption : ()
-      controller requester
+    -- | The owner requests to burn the wrapped IOU to initiate the redemption of the
+    -- | original asset on the source domain. This action archives the contract.
+    choice Burn : ()
+      controller owner
       do
-        archive self
-
-    -- | The issuer acknowledges the redemption request and burns the `WrappedIOU`.
-    -- This action is the trigger for the notary's backend system to communicate
-    -- with the source domain and unlock the original assets.
-    choice AcknowledgeAndBurn : ()
-      controller issuer
-      do
-        -- Fetch the IOU to ensure it's still active and owned by the requester.
-        -- This prevents race conditions where the IOU might have been transferred
-        -- after the redemption request was created.
-        iou <- fetch wrappedIouCid
-        assertMsg "Requester does not own the provided IOU." (iou.owner == requester)
-        assertMsg "IOU details do not match the redemption request." $
-          iou.issuer == issuer &&
-          iou.quantity == quantity &&
-          iou.originalAsset == originalAsset &&
-          iou.sourceLockId == sourceLockId
-
-        -- Burn the IOU contract.
-        archive wrappedIouCid
-
-        -- The successful completion of this choice and archival of the
-        -- RedemptionRequest contract serves as the event for the bridge
-        -- operator's automation to initiate the unlock on the source domain.
         return ()
 
--- | Daml Script to test the lifecycle of a WrappedIOU.
-testWrappedIouLifecycle : Script ()
-testWrappedIouLifecycle = script do
-  -- 1. Party setup
+-- | A stable view type for the `WrappedIOU` template, suitable for UI display and queries.
+data View = View
+  with
+    issuer: Party
+    owner: Party
+    quantity: Decimal
+    description: Text
+    sourceDomainId: Text
+    originalAssetId: Text
+  deriving (Eq, Show)
+
+
+-- | Daml Script to test the lifecycle of a `WrappedIOU` contract.
+-- It covers minting (creation), transfer, and burning (archival).
+test_iou_lifecycle : Script ()
+test_iou_lifecycle = script do
+  -- 1. Setup: Allocate parties for the test scenario.
   notary <- allocatePartyWithHint "Notary" (PartyIdHint "notary")
   alice <- allocatePartyWithHint "Alice" (PartyIdHint "alice")
   bob <- allocatePartyWithHint "Bob" (PartyIdHint "bob")
-  originalIssuer <- allocatePartyWithHint "OriginalIssuer" (PartyIdHint "originalissuer")
 
+  -- 2. Mint: The Notary mints a WrappedIOU for Alice.
+  -- This simulates the outcome of an asset being locked on a source domain.
   let
-    assetDetails = OriginalAssetDetails with
-      issuer = originalIssuer
-      originalOwner = alice
-      symbol = "CUSD"
-      sourceDomainId = "domain-source::1220af23..."
+    qty = 100.0
+    desc = "Wrapped F-USD"
+    sourceDomain = "source-domain-c7"
+    originalAssetIdText = "fa2c10b1-1225-4b06-a669-a1b9204a9f5c"
 
-    sourceLockId1 = "lock-contract-id-001"
-
-  -- 2. Minting a WrappedIOU by the Notary for Alice
   iouCid <- submit notary do
     createCmd WrappedIOU with
       issuer = notary
       owner = alice
-      quantity = 1000.0
-      originalAsset = assetDetails
-      sourceLockId = sourceLockId1
-  debug $ "Notary minted a WrappedIOU for Alice: " <> show iouCid
+      quantity = qty
+      description = desc
+      sourceDomainId = sourceDomain
+      originalAssetId = originalAssetIdText
+      notary = notary
 
-  -- 3. Alice transfers the IOU to Bob
-  transferredIouCid <- submit alice do
+  -- 3. Transfer: Alice transfers her IOU to Bob.
+  iouCid' <- submit alice do
     exerciseCmd iouCid Transfer with newOwner = bob
-  debug $ "Alice transferred the IOU to Bob: " <> show transferredIouCid
 
-  -- 4. Bob splits the IOU
-  (splitCid1, splitCid2) <- submit bob do
-    exerciseCmd transferredIouCid Split with splitQuantity = 400.0
-  debug $ "Bob split the IOU into two: " <> show splitCid1 <> " and " <> show splitCid2
+  -- 4. Verification: Check that the new IOU is owned by Bob.
+  (Some bobIou, _) <- queryContractId bob iouCid'
+  assert (bobIou.owner == bob)
+  assert (bobIou.quantity == qty)
 
-  -- 5. Bob requests redemption for one of the split IOUs
-  requestCid <- submit bob do
-    exerciseCmd splitCid1 RequestRedemption
-  debug $ "Bob requested redemption for 400.0 CUSD: " <> show requestCid
+  -- 5. Burn: Bob burns the IOU to start the redemption process for the original asset.
+  submit bob do
+    exerciseCmd iouCid' Burn
 
-  -- 6. Notary acknowledges and burns the IOU
-  submit notary do
-    exerciseCmd requestCid AcknowledgeAndBurn
-  debug "Notary acknowledged the redemption and burned the IOU."
+  -- 6. Verification: Confirm the IOU contract has been archived.
+  contractIsActive <- queryContractId bob iouCid'
+  assert (contractIsActive == None)
 
-  -- 7. Verify the IOU is archived
-  fetch splitCid1 >>= (\c -> abort "Expected contract to be archived") . some
-    `catch` \case
-      (DamlException (UserError "Contract has been archived")) ->
-        debug "Verified that the WrappedIOU contract was successfully archived (burned)."
-      e -> throw e
-
-  debug "WrappedIOU lifecycle test completed successfully."
+  return ()
