@@ -3,190 +3,211 @@
 
 module BridgeNotary where
 
-import DA.Time (Time, RelTime, getTime, addRelTime, relTime)
 import Daml.Script
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Assert
 
--- | A placeholder for a generic IOU asset. In a production system, this would likely
--- | be a standardized token template, such as one implementing Daml Finance interfaces.
+-- | A simple IOU template representing the original asset to be bridged.
+-- In a real-world scenario, this would likely be a more complex, standardized
+-- asset template from another package (e.g., a fungible token).
 template Iou
   with
     issuer: Party
     owner: Party
-    symbol: Text
+    assetType: Text
     amount: Decimal
   where
     signatory issuer, owner
 
-    nonconsuming choice GetView: Iou
-      controller owner, issuer
-      do return self
+    ensure amount > 0.0
 
-    -- | Owner can lock their IOU to initiate a cross-domain bridge transfer.
-    -- | This consumes the IOU and creates an AssetLock contract.
-    choice LockForBridge : ContractId AssetLock
-      with
-        notary: Party
-        targetRecipient: Party
+    -- Standard transfer choice for the IOU.
+    choice Transfer : ContractId Iou
       controller owner
+      with
+        newOwner: Party
       do
-        now <- getTime
-        create AssetLock with
-          notary
-          owner
-          targetRecipient
-          assetIssuer = issuer
-          assetSymbol = symbol
-          assetAmount = amount
-          lockTime = now
+        create this with owner = newOwner
 
--- | Establishes a party as a notary for the bridge, authorized by the operators
--- | of the participating domains.
-template NotaryRole
+-- | Configuration for the cross-domain bridge, managed by the notary.
+-- This contract is intended to be long-lived and contains static parameters
+-- for the bridge's operation.
+template BridgeConfig
   with
     notary: Party
-    sourceDomainOperator: Party
-    targetDomainOperator: Party
-    bridgeFee: Decimal
+    supportedAssets: Set Text -- e.g., {"USD", "EUR", "CHF"}
+    fee: Decimal            -- A flat fee for the bridging operation (not used in this impl.)
   where
-    signatory notary, sourceDomainOperator, targetDomainOperator
+    signatory notary
+
+    ensure fee >= 0.0
+
+-- | An operational role contract for the Bridge Notary.
+-- This allows the notary to offer bridging services based on the `BridgeConfig`.
+-- It acts as the primary entry point for users wanting to lock assets.
+template BridgeNotaryRole
+  with
+    notary: Party
+    configCid: ContractId BridgeConfig
+  where
+    signatory notary
 
     key notary : Party
     maintainer key
 
--- | Represents an asset locked on the source domain, awaiting processing by the notary.
--- | The original asset contract is consumed to create this lock.
-template AssetLock
+    -- | A user ('sourceOwner') initiates the bridging process by requesting to lock an asset.
+    -- This choice consumes the user's IOU and creates a `LockedAsset` contract,
+    -- which serves as a proof of lock, co-signed by the user and the notary.
+    choice RequestLock : ContractId LockedAsset
+      controller sourceOwner
+      with
+        iouCid: ContractId Iou
+        targetRecipient: Party  -- The party to receive the wrapped asset on the target domain.
+      do
+        config <- fetch configCid
+        iou <- fetch iouCid
+
+        -- Validations
+        ensure (iou.owner == sourceOwner) $
+          "IOU owner must match the controller of this choice."
+        ensure (Set.member iou.assetType config.supportedAssets) $
+          "Asset type " <> iou.assetType <> " is not supported by this bridge."
+
+        -- Consume the original asset and create the lock proof.
+        archive iouCid
+        create LockedAsset with
+          notary
+          sourceOwner
+          targetRecipient
+          originalIouIssuer = iou.issuer
+          assetType = iou.assetType
+          amount = iou.amount
+
+-- | Represents an asset that has been locked on the source domain, awaiting the
+-- minting of its wrapped counterpart on the target domain. This is an agreement
+-- between the original owner and the notary.
+template LockedAsset
   with
     notary: Party
-    owner: Party          -- Original owner on the source domain
-    targetRecipient: Party -- Recipient on the target domain
-    assetIssuer: Party    -- Issuer of the original asset
-    assetSymbol: Text
-    assetAmount: Decimal
-    lockTime: Time        -- Timestamp when the asset was locked
+    sourceOwner: Party
+    targetRecipient: Party
+    originalIouIssuer: Party
+    assetType: Text
+    amount: Decimal
   where
-    signatory owner, assetIssuer
-    observer notary
+    signatory notary, sourceOwner
 
-    key (owner, assetIssuer, assetSymbol, lockTime) : (Party, Party, Text, Time)
-    maintainer key._1
-
-    -- | The notary processes the lock, which signals that a corresponding wrapped asset
-    -- | should be minted on the target domain. This archives the lock and creates a receipt.
-    choice ProcessLock : ContractId ProcessedLockReceipt
+    -- | The notary mints the wrapped asset on the target domain.
+    -- This action is atomic: the state transitions from `LockedAsset` to
+    - `LockedAndMinted`, and the `WrappedIou` is created in the same transaction.
+    choice MintWrappedIou : (ContractId LockedAndMinted, ContractId WrappedIou)
       controller notary
       do
-        processingTime <- getTime
-        create ProcessedLockReceipt with
-          notary
-          owner
-          targetRecipient
-          assetIssuer
-          assetSymbol
-          assetAmount
-          lockTime
-          processingTime
+        -- Create the post-minting lock state contract.
+        lockedAndMintedCid <- create LockedAndMinted with ..
 
-    -- | If the notary fails to process the lock within 24 hours, the owner can reclaim
-    -- | their original asset. This choice becomes available only after the timeout has passed.
-    choice ReclaimOnTimeout : ContractId Iou
-      controller owner
+        -- Create the wrapped asset on the target domain for the recipient.
+        wrappedIouCid <- create WrappedIou with
+          owner = targetRecipient
+          originalLockCid = lockedAndMintedCid
+          ..
+
+        return (lockedAndMintedCid, wrappedIouCid)
+
+    -- | The original owner can cancel the lock request before the notary has minted
+    -- the wrapped asset. This returns the original Iou to the owner.
+    choice CancelLock : ContractId Iou
+      controller sourceOwner
       do
-        -- Get the current ledger time to check against the timeout deadline.
-        now <- getTime
-
-        -- Calculate the deadline: lock time + 24 hours.
-        -- 24 hours = 24 * 60 * 60 = 86400 seconds.
-        let timeoutDuration : RelTime = relTime 86400 0
-        let timeoutDeadline = addRelTime lockTime timeoutDuration
-
-        -- Ensure the timeout period has elapsed before allowing the reclaim.
-        assertMsg
-          ("Timeout period has not yet elapsed. Asset can be reclaimed after " <> show timeoutDeadline)
-          (now > timeoutDeadline)
-
-        -- Re-create the original IOU for the owner, effectively refunding the asset.
         create Iou with
-          issuer = assetIssuer
-          owner = owner
-          symbol = assetSymbol
-          amount = assetAmount
+          issuer = originalIouIssuer
+          owner = sourceOwner
+          ..
 
--- | A receipt confirming that the notary has processed the lock. This contract would
--- | typically be used as evidence on the target domain to authorize minting.
-template ProcessedLockReceipt
+-- | Represents the state of a locked asset after the corresponding wrapped asset
+-- has been successfully minted. It serves as the anchor for the redemption process.
+template LockedAndMinted
+  with
+    notary: Party
+    sourceOwner: Party
+    targetRecipient: Party
+    originalIouIssuer: Party
+    assetType: Text
+    amount: Decimal
+  where
+    signatory notary, sourceOwner
+
+    -- | The final step: the notary unlocks the original asset after verifying proof
+    -- of burn (`BurnReceipt`) from the target domain.
+    choice Unlock : ContractId Iou
+      controller notary
+      with
+        burnReceiptCid: ContractId BurnReceipt
+      do
+        receipt <- fetch burnReceiptCid
+
+        -- Security critical assertions: ensure the burn receipt corresponds exactly
+        -- to this locked asset. `self` refers to the ContractId of this contract.
+        receipt.originalLockCid === self
+        receipt.amount === amount
+        receipt.assetType === assetType
+
+        -- Consume the burn receipt to prevent replay attacks.
+        archive burnReceiptCid
+
+        -- Re-create the original Iou for the party specified in the burn request.
+        create Iou with
+          issuer = originalIouIssuer
+          owner = receipt.unlockRecipient
+          ..
+
+-- | The wrapped asset (IOU) that exists on the target domain. Its value is backed
+-- by the corresponding asset locked on the source domain.
+template WrappedIou
   with
     notary: Party
     owner: Party
-    targetRecipient: Party
-    assetIssuer: Party
-    assetSymbol: Text
-    assetAmount: Decimal
-    lockTime: Time
-    processingTime: Time
+    assetType: Text
+    amount: Decimal
+    originalLockCid: ContractId LockedAndMinted -- Link back to the lock proof
+  where
+    signatory notary, owner
+
+    -- The owner of the wrapped asset can initiate the burn process to redeem
+    -- the original asset on the source domain.
+    choice RequestBurn : ContractId BurnReceipt
+      controller owner
+      with
+        -- The party who should receive the unlocked asset on the source domain.
+        unlockRecipient: Party
+      do
+        create BurnReceipt with
+          burner = owner
+          ..
+
+    -- A wrapped IOU can also be transferred on the target domain.
+    choice TransferWrapped : ContractId WrappedIou
+      controller owner
+      with
+        newOwner: Party
+      do
+        create this with owner = newOwner
+
+-- | A receipt providing evidence that a `WrappedIou` has been burned.
+-- This contract is created on the target domain and observed by the notary,
+-- who uses it to authorize the unlocking of the original asset on the source domain.
+template BurnReceipt
+  with
+    notary: Party
+    burner: Party         -- The party who owned and burned the WrappedIou
+    unlockRecipient: Party
+    amount: Decimal
+    assetType: Text
+    originalLockCid: ContractId LockedAndMinted
   where
     signatory notary
-    observer owner, targetRecipient
+    observer burner
 
--- | Example script to demonstrate the timeout functionality.
-timeoutExample : Script ()
-timeoutExample = script do
-  -- 1. Allocate parties
-  alice <- allocateParty "Alice"
-  bob <- allocateParty "Bob"
-  bank <- allocateParty "Bank"
-  notary <- allocateParty "Notary"
-  sourceOp <- allocateParty "SourceDomainOperator"
-  targetOp <- allocateParty "TargetDomainOperator"
-
-  -- 2. Setup NotaryRole
-  _ <- submit notary do
-    createCmd NotaryRole with notary, sourceDomainOperator=sourceOp, targetDomainOperator=targetOp, bridgeFee = 0.0
-
-  -- 3. Issue an asset to Alice
-  iouCid <- submit bank do
-    createCmd Iou with issuer=bank, owner=alice, symbol="USD", amount=100.0
-
-  -- 4. Alice locks the asset for bridging to Bob on another domain
-  lockTime <- getTime
-  lockCid <- submit alice do
-    exerciseCmd iouCid LockForBridge with notary, targetRecipient = bob
-
-  -- 5. Advance time by 25 hours to simulate the timeout period passing.
-  -- Note: setTime is only available in scripts and testing, not in choices.
-  let futureTime = addRelTime lockTime (relTime (25 * 60 * 60) 0)
-  setTime futureTime
-
-  -- 6. Alice can now successfully reclaim her asset because the notary was unresponsive.
-  reclaimedIouCid <- submit alice do
-    exerciseCmd lockCid ReclaimOnTimeout
-
-  -- 7. Verify the reclaimed IOU has the correct details
-  reclaimedIou <- queryContractId alice reclaimedIouCid
-  assert (reclaimedIou.owner == alice)
-  assert (reclaimedIou.issuer == bank)
-  assert (reclaimedIou.amount == 100.0)
-
-  -- 8. Try to reclaim before timeout (this should fail)
-  -- Reset time and re-run lock
-  now <- getTime
-  setTime now
-  iouCid2 <- submit bank do
-    createCmd Iou with issuer=bank, owner=alice, symbol="USD", amount=50.0
-
-  lockCid2 <- submit alice do
-    exerciseCmd iouCid2 LockForBridge with notary, targetRecipient = bob
-
-  -- Attempt to reclaim immediately
-  submitMustFail alice do
-    exerciseCmd lockCid2 ReclaimOnTimeout
-
-  -- 9. Notary processes before timeout (this should succeed)
-  receiptCid <- submit notary do
-    exerciseCmd lockCid2 ProcessLock
-
-  -- After processing, Alice cannot reclaim because the lock contract is archived.
-  submitMustFail alice do
-    exerciseCmd lockCid2 ReclaimOnTimeout
-
-  return ()
+    key (notary, originalLockCid) : (Party, ContractId LockedAndMinted)
+    maintainer key._1
