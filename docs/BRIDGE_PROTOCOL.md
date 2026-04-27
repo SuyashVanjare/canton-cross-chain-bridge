@@ -1,128 +1,126 @@
-# Canton Cross-Chain Bridge Protocol (CCBP)
+# Canton Cross-Chain Bridge Protocol Specification
 
-This document specifies the protocol for transferring assets between two distinct Canton domains using a lock-mint-burn mechanism. The protocol relies on a trusted Bridge Operator (or Notary) to facilitate the cross-domain communication and asset wrapping.
+This document outlines the protocol for transferring assets between two distinct Canton domains, referred to as the Source Domain and the Destination Domain. The bridge operates on a lock-mint and burn-unlock mechanism, facilitated by a trusted Bridge Notary.
 
 ## 1. Overview
 
-The Canton Cross-Chain Bridge enables users to move assets from a "Source Domain" to a "Target Domain" and back. This is achieved without true cross-domain transactions, but rather by representing the asset on the target domain as a wrapped IOU.
+The Canton Cross-Chain Bridge enables users to move assets from a Source Domain (e.g., a private bank ledger) to a Destination Domain (e.g., a DeFi ecosystem) and back. This is achieved by locking the original asset on the Source Domain and minting a corresponding "wrapped" asset (an IOU) on the Destination Domain. The wrapped asset is fully backed 1:1 by the locked original. To redeem the original asset, the user burns the wrapped asset, which authorizes the unlocking of the original asset on the Source Domain.
 
-The core mechanism is:
-- **Lock & Mint**: An asset on the Source Domain is locked in an escrow contract controlled by the Bridge Operator. The Operator then mints a corresponding "wrapped" asset (an IOU) on the Target Domain and gives it to the user.
-- **Burn & Unlock**: The user burns the wrapped asset on the Target Domain. The Bridge Operator observes this event and subsequently unlocks the original asset on the Source Domain, returning it to the user.
+## 2. Actors
 
-This model ensures that every wrapped asset on the Target Domain is 1:1 backed by a corresponding locked asset on the Source Domain.
+*   **User**: The party who owns an asset and wishes to transfer it across domains.
+*   **Asset Issuer**: The original creator of the asset on the Source Domain (e.g., a commercial bank issuing tokenized deposits).
+*   **Bridge Notary**: A trusted, central party that operates across both domains. The Notary is responsible for:
+    *   Verifying that assets are correctly locked on the Source Domain.
+    *   Authorizing the minting of corresponding wrapped assets on the Destination Domain.
+    *   Verifying that wrapped assets are burned on the Destination Domain.
+    *   Authorizing the unlocking of original assets on the Source Domain.
 
-## 2. Participants
+## 3. Core Concepts
 
-- **User**: The party who owns an asset and wishes to transfer it across domains. The User must have a party identity on both the Source and Target domains.
-- **Bridge Operator**: A trusted, central entity responsible for operating the bridge. The Operator has a party identity on both domains and runs an off-ledger service (e.g., using Canton Triggers or a custom application) to monitor and react to events on both ledgers. The security of the bridge relies on the honesty and liveness of the Operator.
-- **Source Domain**: The Canton domain where the original, canonical asset exists.
-- **Target Domain**: The Canton domain where the wrapped representation of the asset (IOU) is minted and circulated.
+*   **Source Domain**: The Canton domain where the original asset resides.
+*   **Destination Domain**: The Canton domain where the wrapped asset will be minted and used.
+*   **Original Asset**: The asset contract on the Source Domain. It is assumed to have standard transfer capabilities.
+*   **Wrapped Asset**: A contract on the Destination Domain that represents a claim on a locked Original Asset. It is issued by the Bridge Notary.
+*   **Lock/Unlock**: The process of escrowing and releasing the Original Asset on the Source Domain in a contract controlled by the Bridge Notary.
+*   **Mint/Burn**: The process of creating and destroying the Wrapped Asset on the Destination Domain.
 
-## 3. Protocol Flow
+## 4. Protocol Flow: Source Domain → Destination Domain
 
-The protocol consists of two primary workflows: transferring an asset from the Source to the Target domain, and returning it from the Target to the Source domain.
-
-### 3.1 Flow A: Source Domain -> Target Domain (Lock & Mint)
-
-This flow moves an asset from the Source Domain to the Target Domain.
-
-```mermaid
-sequenceDiagram
-    participant User
-    participant Source Domain
-    participant Bridge Operator
-    participant Target Domain
-
-    User->>Source Domain: 1. Create LockRequest(asset, targetParty)
-    Source Domain-->>Bridge Operator: Observe LockRequest
-
-    User->>Source Domain: 2. Exercise Lock choice
-    Note right of Source Domain: Creates LockedAsset contract<br/>Archives LockRequest<br/>Original asset is now in escrow
-
-    Source Domain-->>Bridge Operator: Observe LockedAsset creation
-    Bridge Operator->>Target Domain: 3. Create MintProposal(lockedAssetCid)
-    Target Domain-->>User: Observe MintProposal
-
-    User->>Target Domain: 4. Exercise AcceptMint choice
-    Note right of Target Domain: Creates WrappedAsset for User<br/>Archives MintProposal
-```
-
-**Step-by-step breakdown:**
-
-1.  **Initiation (Source Domain)**: The User initiates the transfer by creating a `LockRequest` contract. This contract specifies the original asset's `ContractId`, the user's `Party` on the Target Domain, and the Bridge Operator's `Party`. The Bridge Operator is an observer on this contract.
-
-2.  **Asset Lock (Source Domain)**: The User exercises the `Lock` choice on the `LockRequest`. This is an atomic transaction that:
-    - Archives the `LockRequest`.
-    - Creates a `LockedAsset` contract. This contract holds the original asset `ContractId` in escrow.
-    - The `LockedAsset` contract has the **Bridge Operator as the signatory**, giving them exclusive control over the asset. The User is an observer to retain visibility.
-
-3.  **Attestation & Proposal (Target Domain)**: The Bridge Operator's off-ledger service observes the creation of the `LockedAsset` contract on the Source Domain. This serves as cryptographic proof that the asset is secured. The Operator then acts on the Target Domain:
-    - It creates a `MintProposal` contract.
-    - This proposal is offered to the User's Target Domain party. It contains details of the lock, including the `ContractId` of the `LockedAsset` contract on the Source Domain, ensuring a clear audit trail.
-
-4.  **Claim Wrapped Asset (Target Domain)**: The User sees the `MintProposal` on the Target Domain and accepts it by exercising the `AcceptMint` choice. This transaction atomically:
-    - Archives the `MintProposal`.
-    - Creates a `WrappedAsset` contract, with the User as the owner. This contract represents the IOU and can now be freely used on the Target Domain.
-
-### 3.2 Flow B: Target Domain -> Source Domain (Burn & Unlock)
-
-This flow returns the asset to its original Source Domain.
+This flow describes locking an asset on the source domain and minting a wrapped equivalent on the destination domain.
 
 ```mermaid
 sequenceDiagram
     participant User
-    participant Target Domain
-    participant Bridge Operator
-    participant Source Domain
+    participant SourceDomain
+    participant BridgeNotary
+    participant DestinationDomain
 
-    User->>Target Domain: 1. Create BurnRequest(wrappedAssetCid)
-    Target Domain-->>Bridge Operator: Observe BurnRequest
+    User->>SourceDomain: 1. Create LockRequest
+    activate SourceDomain
+    Note right of User: User proposes to lock their asset for bridging.
+    SourceDomain-->>BridgeNotary: Notary is stakeholder on LockRequest
+    deactivate SourceDomain
 
-    User->>Target Domain: 2. Exercise Burn choice
-    Note right of Target Domain: Creates BurnReceipt<br/>Archives WrappedAsset<br/>Archives BurnRequest
+    BridgeNotary->>SourceDomain: 2. Accept LockRequest
+    activate SourceDomain
+    Note over SourceDomain: In a single atomic transaction: <br/> - User's OriginalAsset is transferred <br/> - LockRequest is archived <br/> - LockedAsset contract is created
+    SourceDomain-->>BridgeNotary: Notary is signatory on LockedAsset
+    deactivate SourceDomain
 
-    Target Domain-->>Bridge Operator: Observe BurnReceipt creation
-    Bridge Operator->>Source Domain: 3. Exercise Unlock choice on LockedAsset
-    Note right of Source Domain: Original asset is transferred to User<br/>LockedAsset contract is archived
+    BridgeNotary->>DestinationDomain: 3. Create MintAuthorization
+    activate DestinationDomain
+    Note right of BridgeNotary: Notary creates minting rights for the User on the Destination Domain.
+    DestinationDomain-->>User: User is stakeholder on MintAuthorization
+    deactivate DestinationDomain
+
+    User->>DestinationDomain: 4. Exercise Mint
+    activate DestinationDomain
+    Note over DestinationDomain: User claims their wrapped asset. <br/> MintAuthorization is archived and WrappedAsset is created.
+    deactivate DestinationDomain
 ```
 
-**Step-by-step breakdown:**
+**Step-by-step Breakdown:**
 
-1.  **Initiation (Target Domain)**: The User decides to redeem their wrapped asset for the original. They create a `BurnRequest` contract, specifying the `ContractId` of the `WrappedAsset` they wish to burn. The Bridge Operator is an observer.
+1.  **Initiate Lock (User)**: The User creates a `LockRequest` contract on the **Source Domain**. This contract specifies the asset to be locked, the owner, the Bridge Notary, and the target destination address (the User's party ID on the Destination Domain).
+2.  **Confirm Lock (Bridge Notary)**: The Bridge Notary, as a stakeholder on the `LockRequest`, accepts the proposal. This choice atomically:
+    *   Transfers the User's `OriginalAsset` to be held within a new `LockedAsset` contract.
+    *   Makes the Bridge Notary the signatory of the `LockedAsset` contract, effectively placing the asset in escrow.
+    *   Archives the `LockRequest`.
+3.  **Authorize Mint (Bridge Notary)**: Having observed the creation of the `LockedAsset` contract on the Source Domain, the Bridge Notary creates a `MintAuthorization` contract on the **Destination Domain**. This contract grants the User the right to mint a corresponding amount of the wrapped asset.
+4.  **Mint Wrapped Asset (User)**: The User exercises the `Mint` choice on the `MintAuthorization` contract. This atomically archives the `MintAuthorization` and creates a `WrappedAsset` contract, owned by the User, on the Destination Domain.
 
-2.  **Asset Burn (Target Domain)**: The User exercises the `Burn` choice on the `BurnRequest`. This is an atomic transaction that:
-    - Archives the `BurnRequest`.
-    - Archives the user's `WrappedAsset` contract, removing it from circulation.
-    - Creates a `BurnReceipt` contract, co-signed by the User and the Bridge Operator. This receipt is an immutable, on-ledger proof that the wrapped asset was destroyed.
+## 5. Protocol Flow: Destination Domain → Source Domain
 
-3.  **Attestation & Unlock (Source Domain)**: The Bridge Operator's service observes the creation of the `BurnReceipt` on the Target Domain. With proof of burn, the Operator acts on the Source Domain:
-    - It finds the corresponding `LockedAsset` contract (identifiable via the information stored within the `BurnReceipt` which links back to the original lock).
-    - The Operator exercises the `Unlock` choice on the `LockedAsset` contract. This choice is only available to the Operator.
+This flow describes burning the wrapped asset on the destination domain to unlock the original asset on the source domain.
 
-4.  **Claim Original Asset (Source Domain)**: The `Unlock` choice atomically transfers the original asset held in escrow back to the User's Source Domain party and archives the `LockedAsset` contract. The bridge process is now complete.
+```mermaid
+sequenceDiagram
+    participant User
+    participant DestinationDomain
+    participant BridgeNotary
+    participant SourceDomain
 
-## 4. Security & Trust Assumptions
+    User->>DestinationDomain: 1. Create BurnRequest
+    activate DestinationDomain
+    Note right of User: User proposes to burn their wrapped asset to redeem the original.
+    DestinationDomain-->>BridgeNotary: Notary is stakeholder on BurnRequest
+    deactivate DestinationDomain
 
-The security of the bridge is predicated on the following assumptions:
+    BridgeNotary->>DestinationDomain: 2. Accept BurnRequest
+    activate DestinationDomain
+    Note over DestinationDomain: In a single atomic transaction: <br/> - User's WrappedAsset is archived (burned) <br/> - BurnRequest is archived
+    deactivate DestinationDomain
 
-1.  **Trusted Bridge Operator**: The Bridge Operator is the central point of trust. It must be honest and must not:
-    - Mint wrapped assets without a corresponding locked asset (theft via inflation).
-    - Refuse to unlock assets after a valid burn (censorship/griefing).
-    - Unlock assets without a corresponding burn (theft).
-    The protocol's Daml implementation enforces the link between lock/mint and burn/unlock, but the Operator's liveness and honesty are paramount.
+    BridgeNotary->>SourceDomain: 3. Exercise Unlock
+    activate SourceDomain
+    Note right of BridgeNotary: Notary exercises choice on the LockedAsset contract.
+    Note over SourceDomain: In a single atomic transaction: <br/> - LockedAsset is archived <br/> - OriginalAsset is transferred back to User
+    SourceDomain-->>User: User receives their OriginalAsset
+    deactivate SourceDomain
 
-2.  **Canton Domain Integrity**: Both the Source and Target Domains are assumed to be secure, non-compromised Canton networks operating as expected.
+```
 
-3.  **Canton Transaction Finality**: The protocol relies on Canton's guarantee of transaction finality. Once a transaction creating a `LockedAsset` or `BurnReceipt` is committed to the ledger, it cannot be reversed. This eliminates the complexities of chain re-organizations present in many public blockchain bridges.
+**Step-by-step Breakdown:**
 
-4.  **Operator Liveness**: The bridge's liveness depends on the Operator's off-ledger service being online to observe events and submit the necessary cross-domain transactions. If the Operator's service goes down, the bridge will halt, but no funds will be lost. Locked assets will remain locked, and wrapped assets will remain on the target domain until the Operator resumes service.
+1.  **Initiate Burn (User)**: The User, holding a `WrappedAsset` on the **Destination Domain**, creates a `BurnRequest` proposing to burn it in exchange for their original asset.
+2.  **Confirm Burn (Bridge Notary)**: The Bridge Notary accepts the `BurnRequest`. This choice atomically archives (burns) the User's `WrappedAsset` contract.
+3.  **Unlock Original Asset (Bridge Notary)**: Having witnessed the burning of the `WrappedAsset` on the Destination Domain, the Bridge Notary exercises the `Unlock` choice on the corresponding `LockedAsset` contract on the **Source Domain**. This atomically transfers the `OriginalAsset` back to the User and archives the `LockedAsset` contract, completing the redemption.
 
-## 5. Daml Contract States
+## 6. Security & Trust Assumptions
 
-- **`LockRequest`**: A short-lived contract proposed by the User to initiate an asset lock.
-- **`LockedAsset`**: An escrow contract on the Source Domain holding the original asset. Signatory is the Bridge Operator.
-- **`MintProposal`**: The Operator's proposal on the Target Domain to mint a wrapped asset for the User.
-- **`WrappedAsset`**: The IOU token on the Target Domain, owned by the User.
-- **`BurnRequest`**: A short-lived contract proposed by the User to initiate the burning of a `WrappedAsset`.
-- **`BurnReceipt`**: An immutable proof-of-burn on the Target Domain, co-signed by the User and Operator.
+*   **Honest Bridge Notary**: The security of the bridge relies entirely on the assumption that the Bridge Notary is honest and operationally secure. A malicious or compromised Notary could:
+    *   Mint unbacked wrapped assets (inflation).
+    *   Refuse to unlock assets after they are burned (theft).
+    *   Steal locked assets.
+    The Bridge Notary is the central point of trust in this architecture.
+*   **Canton Domain Integrity**: The protocol assumes the underlying security, liveness, and correctness of both the Source and Destination Canton domains. This includes the participant nodes, synchronizers, and mediators involved.
+*   **User Liveness**: The user must be online to complete their half of the protocol (e.g., exercising the `Mint` choice). The protocol provides authorizations that can be exercised at a later time, mitigating short-term connectivity issues.
+
+## 7. Finality Guarantees
+
+The bridge's finality is built upon the strong finality guarantees of the underlying Canton protocol.
+
+*   **Per-Domain Atomicity**: Every step within a single domain (e.g., accepting the `LockRequest` and creating the `LockedAsset`) is a single, atomic Canton transaction. It either completes successfully in its entirety or fails with no state change.
+*   **Cross-Domain Consistency**: The overall bridge process is not a single atomic transaction. It is a sequence of causally-linked atomic transactions across two domains. Consistency is maintained because the trigger for an action on one domain is the observable, final state change on the other. For example, the `MintAuthorization` is only created *after* the `LockedAsset` is successfully and finally created on the Source Domain.
+*   **Observability**: Canton's privacy model ensures that the Bridge Notary can securely observe state changes on both domains without revealing transaction details to unauthorized parties. The creation of `LockedAsset` and the archival of `WrappedAsset` are the key observable events that drive the protocol forward.
